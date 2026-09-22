@@ -1,0 +1,9 @@
+[package]
+name = "editor_core"
+edition = "2021"
+
+[dependencies]
+rayon    = { workspace = true }
+smallvec = { workspace = true }
+ahash    = { workspace = true }
+bitflags = { workspace = true }

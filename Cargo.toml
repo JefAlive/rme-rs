@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/editor_core",
+    "crates/editor_ui",
+    "crates/editor_app",
+    "crates/editor_formats",
+    "crates/editor_render",
+]
+
+[workspace.dependencies]
+rayon         = "1.10"
+smallvec      = "1.13"
+ahash         = "0.8"
+bitflags      = "2.6"
+thiserror     = "1.0"
+egui          = "0.29"
+eframe        = "0.29"
+egui_dock     = "0.14"
+wgpu          = "22"
+bytemuck      = { version = "1.16", features = ["derive"] }

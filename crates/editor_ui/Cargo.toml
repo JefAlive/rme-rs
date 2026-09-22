@@ -1,0 +1,10 @@
+[package]
+name = "editor_ui"
+edition = "2021"
+
+[dependencies]
+editor_core   = { path = "../editor_core" }
+editor_render = { path = "../editor_render" }
+egui      = { workspace = true }
+eframe    = { workspace = true }
+egui_dock = { workspace = true }
