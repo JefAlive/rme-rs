@@ -3,9 +3,9 @@ Cargo.lock
 .tools/
 
 # Reference projects used for AI
-reference-assets/
-reference-maps/
-reference-src/
+reference-assets
+reference-maps
+reference-src
 
 # Output directories
 target/
