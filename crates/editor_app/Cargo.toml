@@ -7,9 +7,10 @@ name = "rme-rs"
 path = "src/main.rs"
 
 [dependencies]
-editor_core = { path = "../../crates/editor_core" }
-editor_ui   = { path = "../../crates/editor_ui" }
-egui        = { workspace = true }
-eframe      = { workspace = true, default-features = false, features = ["wgpu", "default_fonts"] }
-egui_dock   = { workspace = true }
-env_logger  = "0.11.11"
+editor_core   = { path = "../editor_core" }
+editor_ui     = { path = "../editor_ui" }
+editor_render = { path = "../editor_render" }
+egui          = { workspace = true }
+eframe        = { workspace = true, default-features = false, features = ["wgpu", "default_fonts"] }
+egui_dock     = { workspace = true }
+env_logger    = "0.11"
