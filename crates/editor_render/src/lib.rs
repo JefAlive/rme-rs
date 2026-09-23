@@ -4,3 +4,4 @@ pub mod offscreen;
 pub mod scene;
 pub mod atlas;
 pub mod assets;
+pub mod anim;

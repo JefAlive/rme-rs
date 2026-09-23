@@ -7,7 +7,6 @@ const PAN_SPEED_TILES_PER_SEC: f32 = 12.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 8.0;
 
-/// Bounding box dos tiles com chão no andar informado (para a câmera).
 fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16)> {
     let mut min_x = u16::MAX;
     let mut min_y = u16::MAX;
@@ -16,9 +15,7 @@ fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16
     let mut found = false;
 
     for (coord, _chunk) in map.iter_chunk_coords() {
-        if coord.z != floor {
-            continue;
-        }
+        if coord.z != floor { continue; }
         for local_idx in 0..(editor_core::position::CHUNK_SIZE as usize * editor_core::position::CHUNK_SIZE as usize) {
             let lx = (local_idx % editor_core::position::CHUNK_SIZE as usize) as u16;
             let ly = (local_idx / editor_core::position::CHUNK_SIZE as usize) as u16;
@@ -38,60 +35,32 @@ fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16
             }
         }
     }
-
-    if found {
-        Some((min_x, min_y, max_x, max_y))
-    } else {
-        None
-    }
+    if found { Some((min_x, min_y, max_x, max_y)) } else { None }
 }
 
-/// Espelha a regra de composição multi-andar do RME (SetupVars/DrawMap):
-/// no térreo ou acima (floor <= 7), a pilha vai do térreo (7) até o telhado
-/// mais alto (0); no subsolo (floor > 7), desenha até 2 andares abaixo do
-/// atual. Retorna (start_z, end_z = floor, superend_z).
 fn compute_floor_stack(current_floor: u8) -> (u8, u8, u8) {
     let ground = editor_core::position::GROUND_FLOOR;
     let max_z = editor_core::position::MAP_MAX_Z;
-    let start_z = if current_floor < 8 {
-        ground
-    } else {
-        (current_floor + 2).min(max_z)
-    };
+    let start_z = if current_floor < 8 { ground } else { (current_floor + 2).min(max_z) };
     let superend_z = if current_floor > ground { 8 } else { 0 };
     (start_z, current_floor, superend_z)
 }
 
 pub enum EditorTab {
     Viewport { doc_index: usize },
-    Objects,
-    Towns,
-    Houses,
-    Zones,
-    Project,
-    World,
-    Inspector,
-    Minimap,
-    Console,
+    Objects, Towns, Houses, Zones, Project, World, Inspector, Minimap, Console,
 }
-
-// ---------- Grupos de seleção independentes (cada um é seu próprio "radio group") ----------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SelectionBrush { SingleSelect, Eraser, Border }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ZoneBrush { ProtectionZone, NoPvp, Pvp, NoLogout }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DoorBrush { Normal, Quest, Locked, Magic }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WindowBrush { Normal, Hatched }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BrushShape { Circle, Square }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AntiAliasing { Off, Retro, CrtBlend, RoundedEdges }
 
@@ -106,11 +75,9 @@ impl AntiAliasing {
     }
 }
 
-/// Estado global compartilhado entre abas.
 pub struct AppState {
     pub documents: Vec<MapDocument>,
     pub active_doc: usize,
-
     pub selection_brush: Option<SelectionBrush>,
     pub zone_brush: Option<ZoneBrush>,
     pub door_brush: Option<DoorBrush>,
@@ -119,22 +86,18 @@ pub struct AppState {
     pub auto_border_active: bool,
     pub brush_thickness: i32,
     pub brush_size: i32,
-
     pub city_filter: String,
     pub item_name_filter: String,
-
     pub world_light: u8,
     pub show_tooltips: bool,
     pub show_npcs: bool,
     pub show_monsters: bool,
     pub show_zones: bool,
     pub antialiasing: AntiAliasing,
-
     pub current_zoom: u32,
     pub current_floor_display: u8,
     pub hover_info: HoverInfo,
     pub log_lines: Vec<String>,
-
     pub wgpu: Option<egui_wgpu::RenderState>,
     pub tile_resources: Option<editor_render::pipeline::TileRenderResources>,
     pub offscreen: Option<editor_render::offscreen::OffscreenTarget>,
@@ -143,6 +106,7 @@ pub struct AppState {
     pub camera_zoom: f32,
     pub atlas: Option<editor_render::atlas::SpriteAtlas>,
     pub sprite_resolver: Option<editor_render::assets::SpriteResolver>,
+    pub anim_table: Option<editor_render::anim::AnimTable>,
     pub camera_fit_pending: bool,
 }
 
@@ -179,6 +143,7 @@ impl Default for AppState {
             camera_zoom: 1.0,
             atlas: None,
             sprite_resolver: None,
+            anim_table: None,
             camera_fit_pending: true,
         }
     }
@@ -193,16 +158,12 @@ pub struct HoverInfo {
 
 fn radio_button<T: PartialEq + Copy>(ui: &mut Ui, current: &mut Option<T>, value: T, label: &str) {
     let selected = *current == Some(value);
-    if ui.selectable_label(selected, label).clicked() {
-        *current = Some(value);
-    }
+    if ui.selectable_label(selected, label).clicked() { *current = Some(value); }
 }
 
 fn radio_button_req<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, value: T, label: &str) {
     let selected = *current == value;
-    if ui.selectable_label(selected, label).clicked() {
-        *current = value;
-    }
+    if ui.selectable_label(selected, label).clicked() { *current = value; }
 }
 
 pub struct EditorTabViewer<'a> {
@@ -215,10 +176,7 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         match tab {
             EditorTab::Viewport { doc_index } => {
-                self.state.documents.get(*doc_index)
-                    .map(|d| d.name.clone())
-                    .unwrap_or_else(|| "Viewport".into())
-                    .into()
+                self.state.documents.get(*doc_index).map(|d| d.name.clone()).unwrap_or_else(|| "Viewport".into()).into()
             }
             EditorTab::Objects   => "Objects".into(),
             EditorTab::Towns     => "Towns".into(),
@@ -259,7 +217,6 @@ impl<'a> EditorTabViewer<'a> {
             self.state.camera_offset -= resp.drag_delta() / self.state.camera_zoom;
         }
 
-        // --- Navegação: zoom no scroll (ancorado no cursor), pan WASD, andar Q/E ---
         if resp.hovered() {
             let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll_y != 0.0 {
@@ -268,7 +225,6 @@ impl<'a> EditorTabViewer<'a> {
                     let old_zoom = self.state.camera_zoom;
                     let new_zoom = (old_zoom * (1.0 + scroll_y * 0.001)).clamp(ZOOM_MIN, ZOOM_MAX);
                     if (new_zoom - old_zoom).abs() > f32::EPSILON {
-                        // Mantém o ponto do mundo sob o cursor fixo ao zoomar.
                         self.state.camera_offset.x += local.x * (1.0 / old_zoom - 1.0 / new_zoom);
                         self.state.camera_offset.y += local.y * (1.0 / old_zoom - 1.0 / new_zoom);
                         self.state.camera_zoom = new_zoom;
@@ -290,26 +246,27 @@ impl<'a> EditorTabViewer<'a> {
             }
 
             if ui.input(|i| i.key_pressed(egui::Key::Q)) {
-                self.state.current_floor_display =
-                    (self.state.current_floor_display + 1).min(editor_core::position::MAP_MAX_Z);
+                self.state.current_floor_display = (self.state.current_floor_display + 1).min(editor_core::position::MAP_MAX_Z);
             }
             if ui.input(|i| i.key_pressed(egui::Key::E)) {
                 self.state.current_floor_display = self.state.current_floor_display.saturating_sub(1);
             }
-
-            // WASD precisa de repaint contínuo enquanto a tecla está segurada.
-            ui.ctx().request_repaint();
         }
+
+        // Repaint contínuo: itens animados precisam redesenhar mesmo sem
+        // interação do usuário (WASD/scroll não são a única razão de repintar).
+        ui.ctx().request_repaint();
 
         if let Some(wgpu_state) = self.state.wgpu.clone() {
             let device = &wgpu_state.device;
             let queue = &wgpu_state.queue;
 
             if self.state.tile_resources.is_none() {
-                if let Some(atlas) = &self.state.atlas {
+                if let (Some(atlas), Some(anim_table)) = (&self.state.atlas, &self.state.anim_table) {
                     self.state.tile_resources = Some(
                         editor_render::pipeline::TileRenderResources::new(
-                            device, editor_render::offscreen::OFFSCREEN_FORMAT, &atlas.bind_group_layout,
+                            device, editor_render::offscreen::OFFSCREEN_FORMAT,
+                            &atlas.bind_group_layout, &anim_table.bind_group_layout,
                         )
                     );
                 }
@@ -330,30 +287,30 @@ impl<'a> EditorTabViewer<'a> {
             let floor = self.state.current_floor_display;
             let (start_z, end_z, superend_z) = compute_floor_stack(floor);
 
-            // Extrai sprite_resolver/atlas do AppState por um instante: assim os
-            // closures abaixo não capturam NADA de `self` — elimina qualquer
-            // disputa de borrow com `doc` ou `chunk_cache`.
             let mut sprite_resolver = self.state.sprite_resolver.take();
             let mut atlas_for_resolve = self.state.atlas.take();
+            let mut anim_table_for_resolve = self.state.anim_table.take();
             {
                 let doc = &mut self.state.documents[doc_index];
                 let mut z = start_z;
                 loop {
-                    let resolver = |type_id: u16| -> u32 {
-                        let (Some(resolver), Some(atlas)) = (sprite_resolver.as_mut(), atlas_for_resolve.as_mut()) else {
-                            return 0;
+                    let resolve_visual = |type_id: u16| -> editor_render::assets::ItemVisual {
+                        let (Some(resolver), Some(atlas), Some(anim_table)) = (
+                            sprite_resolver.as_mut(), atlas_for_resolve.as_mut(), anim_table_for_resolve.as_mut(),
+                        ) else {
+                            return editor_render::assets::ItemVisual::default();
                         };
-                        resolver.layer_for(device, queue, atlas, type_id)
+                        resolver.visual_for(device, queue, atlas, anim_table, type_id)
                     };
-                    self.state.chunk_cache.sync_for_floor(device, &mut doc.map, z, resolver);
+                    self.state.chunk_cache.sync_for_floor(device, &mut doc.map, z, resolve_visual);
                     if z == superend_z { break; }
                     z -= 1;
                 }
             }
             self.state.sprite_resolver = sprite_resolver;
             self.state.atlas = atlas_for_resolve;
+            self.state.anim_table = anim_table_for_resolve;
 
-            // Camera fit: centraliza no bbox do mapa no primeiro frame.
             if self.state.camera_fit_pending {
                 let doc = &self.state.documents[doc_index];
                 if let Some((min_x, min_y, max_x, max_y)) = compute_map_bounds(&doc.map, floor) {
@@ -365,24 +322,21 @@ impl<'a> EditorTabViewer<'a> {
                     let zoom_x = width as f32 / map_w;
                     let zoom_y = height as f32 / map_h;
                     self.state.camera_zoom = zoom_x.min(zoom_y) * 0.9;
-                    eprintln!("camera fit: floor={floor} bbox=({min_x}..{max_x} x {min_y}..{max_y}) zoom={:.3}",
-                        self.state.camera_zoom);
                     self.state.camera_fit_pending = false;
                 }
             }
 
-            // Pilha de andares a compor: distância do andar atual define alfa
-            // e deslocamento diagonal; o andar atual (distância 0) é desenhado
-            // por último, opaco, por cima do contexto semitransparente.
+            // Pilha de andares: distância COM SINAL do andar atual — corrige
+            // o alinhamento diagonal (acima = x-1,y-1; abaixo = x+1,y+1).
             let mut layers: Vec<editor_render::scene::FloorLayer> = Vec::new();
             {
                 let mut z = start_z;
                 loop {
-                    let distance = (end_z as i32 - z as i32).unsigned_abs() as f32;
+                    let signed = (end_z as i32 - z as i32) as f32;
                     layers.push(editor_render::scene::FloorLayer {
                         z,
                         alpha: if z == end_z { 1.0 } else { 0.35 },
-                        pixel_offset: [distance * 32.0, distance * 32.0],
+                        pixel_offset: [signed * 32.0, signed * 32.0],
                     });
                     if z == superend_z { break; }
                     z -= 1;
@@ -390,17 +344,20 @@ impl<'a> EditorTabViewer<'a> {
             }
             layers.sort_by_key(|l| if l.z == end_z { 1 } else { 0 });
 
+            let time_ms = ui.input(|i| i.time) as f32 * 1000.0;
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
                 zoom: self.state.camera_zoom,
-                _pad: 0.0,
+                time_ms,
                 viewport_size: [width as f32, height as f32],
                 floor_alpha: 1.0,
-                _pad2: 0.0,
+                _pad: 0.0,
             };
-            if let (Some(resources), Some(atlas)) = (&self.state.tile_resources, &self.state.atlas) {
+            if let (Some(resources), Some(atlas), Some(anim_table)) =
+                (&self.state.tile_resources, &self.state.atlas, &self.state.anim_table)
+            {
                 editor_render::scene::render_frame(
-                    device, queue, resources, &self.state.chunk_cache, atlas,
+                    device, queue, resources, &self.state.chunk_cache, atlas, anim_table,
                     self.state.offscreen.as_ref().unwrap(), camera, &layers,
                 );
             }
@@ -449,10 +406,8 @@ impl<'a> EditorTabViewer<'a> {
     fn ui_objects(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Filter: City / Biome").weak());
         egui::ComboBox::from_id_salt("city_filter")
-            .selected_text(if self.state.city_filter.is_empty() {
-                "[8.0] Svargrond - Ice & Viking Isle"
-            } else { &self.state.city_filter })
-            .show_ui(ui, |_ui| { /* popular via ItemTypeTable/worlds */ });
+            .selected_text(if self.state.city_filter.is_empty() { "[8.0] Svargrond - Ice & Viking Isle" } else { &self.state.city_filter })
+            .show_ui(ui, |_ui| {});
 
         ui.separator();
         ui.label(RichText::new("Filter: Item Name").weak());
@@ -464,7 +419,6 @@ impl<'a> EditorTabViewer<'a> {
         });
 
         ui.separator();
-
         ui.label(RichText::new("Selection").weak());
         radio_button(ui, &mut self.state.selection_brush, SelectionBrush::SingleSelect, "Single Select");
         ui.horizontal(|ui| {

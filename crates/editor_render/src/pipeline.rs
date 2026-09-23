@@ -1,8 +1,6 @@
 use wgpu::util::DeviceExt;
 use crate::instance::TileInstance;
 
-/// Máximo de andares desenhados num frame. A regra do RME nunca produz mais
-/// que 8 (rooftop stack completo ou subsolo+2), 16 dá folga sem desperdício.
 pub const MAX_FLOOR_LAYERS: usize = 16;
 
 pub struct TileRenderResources {
@@ -10,8 +8,6 @@ pub struct TileRenderResources {
     pub quad_vbuf: wgpu::Buffer,
     pub camera_buf: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
-    /// Stride (bytes) entre entradas consecutivas no camera_buf, já alinhado
-    /// a `min_uniform_buffer_offset_alignment` do device.
     pub camera_stride: u32,
 }
 
@@ -20,24 +16,24 @@ pub struct TileRenderResources {
 pub struct CameraUniform {
     pub offset: [f32; 2],
     pub zoom: f32,
-    pub _pad: f32,
+    pub time_ms: f32,
     pub viewport_size: [f32; 2],
     pub floor_alpha: f32,
-    pub _pad2: f32,
+    pub _pad: f32,
 }
 
 impl TileRenderResources {
-    /// `target_format` precisa ser o formato da textura OFFSCREEN, não o da swapchain.
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, atlas_bgl: &wgpu::BindGroupLayout) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        atlas_bgl: &wgpu::BindGroupLayout,
+        anim_bgl: &wgpu::BindGroupLayout,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
-        // Uma entrada de CameraUniform por andar desenhado no frame, selecionada
-        // via dynamic offset — necessário porque vários draw calls no mesmo
-        // encoder não podem depender de reescritas sequenciais do MESMO byte
-        // range (só a última escrita sobreviveria até o submit).
         let align = device.limits().min_uniform_buffer_offset_alignment as u64;
         let unpadded = std::mem::size_of::<CameraUniform>() as u64;
         let camera_stride = unpadded.div_ceil(align) * align;
@@ -78,7 +74,7 @@ impl TileRenderResources {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile_pipeline_layout"),
-            bind_group_layouts: &[&camera_bgl, atlas_bgl],
+            bind_group_layouts: &[&camera_bgl, atlas_bgl, anim_bgl],
             push_constant_ranges: &[],
         });
 

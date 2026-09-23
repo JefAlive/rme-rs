@@ -30,9 +30,10 @@ impl RmeApp {
             ..Default::default()
         };
 
-        // Atlas vazio (cresce sob demanda via SpriteResolver)
+        // Atlas + tabela de animação vazios (crescem sob demanda via SpriteResolver)
         if let Some(rs) = &state.wgpu {
             state.atlas = Some(SpriteAtlas::new(&rs.device));
+            state.anim_table = Some(editor_render::anim::AnimTable::new(&rs.device, &rs.queue));
         }
 
         // Carregar assets reais + mapa
