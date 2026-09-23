@@ -1,5 +1,44 @@
-use editor_core::MapDocument;
+use editor_core::{MapDocument, position::Position, spatial_map::SpatialMap};
 use egui::{RichText, Ui};
+
+/// Bounding box dos tiles com chão no andar informado (para a câmera).
+fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16)> {
+    let mut min_x = u16::MAX;
+    let mut min_y = u16::MAX;
+    let mut max_x = u16::MIN;
+    let mut max_y = u16::MIN;
+    let mut found = false;
+
+    for (coord, _chunk) in map.iter_chunk_coords() {
+        if coord.z != floor {
+            continue;
+        }
+        for local_idx in 0..(editor_core::position::CHUNK_SIZE as usize * editor_core::position::CHUNK_SIZE as usize) {
+            let lx = (local_idx % editor_core::position::CHUNK_SIZE as usize) as u16;
+            let ly = (local_idx / editor_core::position::CHUNK_SIZE as usize) as u16;
+            let pos = Position {
+                x: coord.cx as u16 * editor_core::position::CHUNK_SIZE + lx,
+                y: coord.cy as u16 * editor_core::position::CHUNK_SIZE + ly,
+                z: coord.z,
+            };
+            if let Some(tile) = map.get_tile(pos) {
+                if tile.ground.is_some() {
+                    found = true;
+                    min_x = min_x.min(pos.x);
+                    min_y = min_y.min(pos.y);
+                    max_x = max_x.max(pos.x);
+                    max_y = max_y.max(pos.y);
+                }
+            }
+        }
+    }
+
+    if found {
+        Some((min_x, min_y, max_x, max_y))
+    } else {
+        None
+    }
+}
 
 pub enum EditorTab {
     Viewport { doc_index: usize },
@@ -84,6 +123,10 @@ pub struct AppState {
     pub camera_offset: egui::Vec2,
     pub camera_zoom: f32,
     pub atlas: Option<editor_render::atlas::SpriteAtlas>,
+    /// Resolvedor de sprites (type_id → layer do atlas).
+    pub sprite_resolver: Option<editor_render::assets::SpriteResolver>,
+    /// Se true, a câmera será centralizada no bbox do mapa no primeiro frame.
+    pub camera_fit_pending: bool,
 }
 
 impl Default for AppState {
@@ -117,7 +160,9 @@ impl Default for AppState {
             chunk_cache: Default::default(),
             camera_offset: egui::Vec2::ZERO,
             camera_zoom: 1.0,
-            atlas: None
+            atlas: None,
+            sprite_resolver: None,
+            camera_fit_pending: true,
         }
     }
 }
@@ -225,9 +270,43 @@ impl<'a> EditorTabViewer<'a> {
                 }
             }
 
-            let doc = &mut self.state.documents[doc_index];
-            // Fase 4+: resolver real (ItemTypeTable -> sprite id -> layer do atlas).
-            self.state.chunk_cache.sync(device, &mut doc.map, |type_id| type_id as u32);
+            let floor = self.state.current_floor_display;
+
+            // Extrai sprite_resolver/atlas do AppState por um instante: assim o
+            // closure abaixo não precisa capturar NADA de `self` — elimina de
+            // vez qualquer disputa de borrow com `doc` ou `chunk_cache`.
+            let mut sprite_resolver = self.state.sprite_resolver.take();
+            let mut atlas_for_resolve = self.state.atlas.take();
+            {
+                let doc = &mut self.state.documents[doc_index];
+                let resolver = |type_id: u16| -> u32 {
+                    let (Some(resolver), Some(atlas)) = (sprite_resolver.as_mut(), atlas_for_resolve.as_mut()) else {
+                        return 0;
+                    };
+                    resolver.layer_for(device, queue, atlas, type_id)
+                };
+                self.state.chunk_cache.sync_for_floor(device, &mut doc.map, floor, resolver);
+            }
+            self.state.sprite_resolver = sprite_resolver;
+            self.state.atlas = atlas_for_resolve;
+
+            // Camera fit: centraliza no bbox do mapa no primeiro frame.
+            if self.state.camera_fit_pending {
+                let doc = &self.state.documents[doc_index];
+                if let Some((min_x, min_y, max_x, max_y)) = compute_map_bounds(&doc.map, floor) {
+                    let map_w = (max_x as f32 - min_x as f32 + 1.0) * 32.0;
+                    let map_h = (max_y as f32 - min_y as f32 + 1.0) * 32.0;
+                    let center_x = (min_x as f32 + max_x as f32 + 1.0) * 16.0;
+                    let center_y = (min_y as f32 + max_y as f32 + 1.0) * 16.0;
+                    self.state.camera_offset = egui::Vec2::new(center_x, center_y);
+                    let zoom_x = width as f32 / map_w;
+                    let zoom_y = height as f32 / map_h;
+                    self.state.camera_zoom = zoom_x.min(zoom_y) * 0.9;
+                    eprintln!("camera fit: floor={floor} bbox=({min_x}..{max_x} x {min_y}..{max_y}) zoom={:.3}",
+                        self.state.camera_zoom);
+                    self.state.camera_fit_pending = false;
+                }
+            }
 
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
@@ -255,8 +334,6 @@ impl<'a> EditorTabViewer<'a> {
                 "wgpu render state indisponível", egui::FontId::default(), egui::Color32::WHITE);
         }
 
-        // clique pinta um tile — mesma lógica de antes, agora convertendo
-        // coordenada de tela -> mundo considerando pan/zoom
         if resp.clicked() {
             if let Some(pos) = ui.ctx().pointer_interact_pos() {
                 let local = pos - rect.min;
@@ -276,7 +353,6 @@ impl<'a> EditorTabViewer<'a> {
             }
         }
 
-        // status bar (igual ao que já tínhamos)
         ui.horizontal(|ui| {
             let h = &self.state.hover_info;
             ui.label(format!("Position: [{}, {}, {}]", h.x, h.y, h.z));

@@ -1,39 +1,14 @@
-use editor_core::{
-    item::Item,
-    position::{Position, GROUND_FLOOR},
-    MapDocument,
-};
+use editor_core::import::{import_otbm, is_subtype_embedded, Bounds};
+use editor_formats::otbm::parse;
 use editor_render::atlas::SpriteAtlas;
+use editor_render::assets::SpriteResolver;
 use editor_ui::tabs::{AppState, EditorTab, EditorTabViewer};
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
+use std::path::Path;
 
-/// Fase 0->4: atlas placeholder com alguns quadrados coloridos.
-/// A partir da Fase 4 o atlas é alimentado pelos sprites reais
-/// (appearances.dat + catalog-content.json + sheets LZMA).
-fn placeholder_sprites() -> Vec<[u8; 32 * 32 * 4]> {
-    let colors: [[u8; 4]; 4] = [
-        [220, 60, 60, 255],
-        [60, 200, 90, 255],
-        [70, 120, 230, 255],
-        [235, 215, 90, 255],
-    ];
-    colors
-        .into_iter()
-        .map(|c| {
-            let mut rgba = [0u8; 32 * 32 * 4];
-            for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
-                let (cx, cy) = ((i % 32) as u8, (i / 32) as u8);
-                let light = ((cx / 8 + cy / 8) % 2 == 1) as u8;
-                let shade = if light == 1 { 0 } else { 90 };
-                px[0] = c[0].saturating_sub(shade);
-                px[1] = c[1].saturating_sub(shade);
-                px[2] = c[2].saturating_sub(shade);
-                px[3] = 255;
-            }
-            rgba
-        })
-        .collect()
-}
+/// Caminhos de debug para assets e mapa real.
+const ASSETS_DIR: &str = "reference-assets";
+const MAP_PATH: &str = "reference-maps/Dawnport.otbm";
 
 struct RmeApp {
     dock_state: DockState<EditorTab>,
@@ -42,7 +17,7 @@ struct RmeApp {
 
 impl RmeApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // --- Diagnóstico: confirma se o backend wgpu realmente inicializou ---
+        // Diagnóstico wgpu
         eprintln!("wgpu_render_state presente? {}", cc.wgpu_render_state.is_some());
         if let Some(rs) = &cc.wgpu_render_state {
             let info = rs.adapter.get_info();
@@ -55,23 +30,29 @@ impl RmeApp {
             ..Default::default()
         };
 
-        let mut atlas_opt = None;
+        // Atlas vazio (cresce sob demanda via SpriteResolver)
         if let Some(rs) = &state.wgpu {
-            let _sprites = placeholder_sprites();
-            eprintln!("atlas placeholder: {} camadas (não usado — atlas cresce sob demanda)", _sprites.len());
-            atlas_opt = Some(SpriteAtlas::new(&rs.device));
+            state.atlas = Some(SpriteAtlas::new(&rs.device));
         }
-        state.atlas = atlas_opt;
 
-        let mut doc = MapDocument::new("Global.otbm");
-        for y in 0..16u16 {
-            for x in 0..16u16 {
-                let pos = Position { x, y, z: GROUND_FLOOR };
-                let type_id = 1 + ((x + y * 7) % 4);
-                doc.map.get_tile_mut(pos).ground = Some(Item::new(type_id));
+        // Carregar assets reais + mapa
+        if state.wgpu.is_some() {
+            match Self::load_real_assets(&mut state) {
+                Ok(bounds) => {
+                    eprintln!("mapa carregado: bbox=({}..{} x {}..{}) z={}..{}",
+                        bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y,
+                        bounds.min_z, bounds.max_z);
+                    // O camera_fit no tabs.rs centraliza no primeiro frame
+                    state.camera_fit_pending = true;
+                }
+                Err(e) => {
+                    eprintln!("falha carregando assets/mapa: {e}; usando mapa demo vazio");
+                    state.camera_fit_pending = false;
+                }
             }
+        } else {
+            eprintln!("wgpu não disponível — modo headless");
         }
-        state.documents.push(doc);
 
         // Layout do dock: espelha o protótipo ImRAD.
         let mut dock_state = DockState::new(vec![EditorTab::Viewport { doc_index: 0 }]);
@@ -98,6 +79,73 @@ impl RmeApp {
         surface.split_below(left, 0.75, vec![EditorTab::Console]);
 
         Self { dock_state, state }
+    }
+}
+
+impl RmeApp {
+    /// Carrega appearances.dat + catalog-content.json + Dawnport.otbm.
+    /// Retorna o bbox do mapa para camera fit.
+    fn load_real_assets(
+        state: &mut AppState,
+    ) -> Result<Bounds, String> {
+        // 1. Carregar appearances.dat via editor_formats
+        let appearances_path = Path::new(ASSETS_DIR).join("appearances-e8a12a674c42b8383b7205a42146efe7976f4beac9bf16353ec96dbdb62891e8.dat");
+        let appearances_data = std::fs::read(&appearances_path)
+            .map_err(|e| format!("falha lendo appearances.dat: {e}"))?;
+        let table = editor_formats::appearances::load_appearances(&appearances_data)
+            .ok_or("falha parseando appearances.dat")?;
+
+        // 2. Carregar catalog-content.json + sheets (SpriteResolver)
+        let resolver = SpriteResolver::load(ASSETS_DIR)
+            .map_err(|e| format!("falha carregando SpriteResolver: {e}"))?;
+        state.sprite_resolver = Some(resolver);
+
+        // 3. Parse OTBM
+        let otbm_data = std::fs::read(MAP_PATH)
+            .map_err(|e| format!("falha lendo {MAP_PATH}: {e}"))?;
+        let subtype_embedded = |id| is_subtype_embedded(&table, id);
+        let doc = parse(&otbm_data, subtype_embedded)
+            .map_err(|e| format!("parse OTBM falhou: {e}"))?;
+
+        // 4. Estatísticas de importação (logs úteis para debug).
+        //    OtmTile (saída crua do parser) NÃO sabe o que é "chão" — isso só
+        //    é decidido consultando a ItemTypeTable, então replicamos aqui a
+        //    mesma checagem que `import_otbm`/`add_item` fazem internamente:
+        //    o primeiro item cujo ItemGroup é Ground é considerado o chão.
+        let mut per_floor: std::collections::BTreeMap<u8, (u64, u64)> = std::collections::BTreeMap::new();
+        let mut grounds_z7: u64 = 0;
+        let mut items_z7: u64 = 0;
+        for t in &doc.tiles {
+            let entry = per_floor.entry(t.z).or_default();
+            entry.0 += 1;
+            entry.1 += t.items.len() as u64;
+            if t.z == 7 {
+                let has_ground = t.items.iter().any(|item| {
+                    table.get_opt(item.id)
+                        .is_some_and(|ty| ty.group == editor_formats::appearances::ItemGroup::Ground)
+                });
+                if has_ground {
+                    grounds_z7 += 1;
+                }
+                items_z7 += t.items.len() as u64;
+            }
+        }
+
+        // 5. Importar para MapDocument (com bounds)
+        let (doc_map, bounds) = import_otbm(&doc, &table);
+        let mut state_ref = std::mem::take(state);
+        state_ref.documents.push(doc_map);
+        *state = state_ref;
+
+        // 6. Logs de estatísticas
+        eprintln!("import OTBM: tiles={} warnings={} floors={}",
+            doc.tiles.len(), doc.warnings.len(), per_floor.len());
+        for (z, (tiles, items)) in &per_floor {
+            eprintln!("import OTBM: z={z} tiles={tiles} items={items}");
+        }
+        eprintln!("import OTBM: z=7 ground_tiles={grounds_z7} items={items_z7}");
+
+        Ok(bounds)
     }
 }
 

@@ -12,8 +12,19 @@ impl ChunkGpuCache {
     /// Só retesselado os chunks marcados dirty — o resto do mapa não custa nada.
     /// A resolução `type_id -> layer do atlas` fica a cargo do chamador (Fase 4);
     /// aqui o chão vira um quad 32x32 na camada resolvida.
-    pub fn sync(&mut self, device: &wgpu::Device, map: &mut SpatialMap, resolve_layer: impl Fn(u16) -> u32) {
-        let dirty: Vec<ChunkCoord> = map.iter_dirty_chunks().map(|(c, _)| *c).collect();
+    ///
+    /// Apenas os chunks do andar `floor` são sincronizados.
+    pub fn sync_for_floor(
+        &mut self,
+        device: &wgpu::Device,
+        map: &mut SpatialMap,
+        floor: u8,
+        mut resolve_layer: impl FnMut(u16) -> u32,
+    ) {
+        let dirty: Vec<ChunkCoord> = map.iter_dirty_chunks()
+            .filter(|(c, _)| c.z == floor)
+            .map(|(c, _)| *c)
+            .collect();
         for coord in dirty {
             let mut instances = Vec::with_capacity(256);
             for local_idx in 0..(CHUNK_SIZE as usize * CHUNK_SIZE as usize) {
@@ -24,14 +35,14 @@ impl ChunkGpuCache {
                     y: coord.cy as u16 * CHUNK_SIZE + ly,
                     z: coord.z,
                 };
-                if let Some(tile) = map.get_tile(pos)
-                    && let Some(ground) = &tile.ground
-                {
-                    instances.push(TileInstance {
-                        world_pos: [pos.x as f32, pos.y as f32],
-                        layer_index: resolve_layer(ground.type_id),
-                        tint: [1.0, 1.0, 1.0, 1.0],
-                    });
+                if let Some(tile) = map.get_tile(pos) {
+                    if let Some(ground) = &tile.ground {
+                        instances.push(TileInstance {
+                            world_pos: [pos.x as f32, pos.y as f32],
+                            layer_index: resolve_layer(ground.type_id),
+                            tint: [1.0, 1.0, 1.0, 1.0],
+                        });
+                    }
                 }
             }
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -77,7 +88,7 @@ pub fn render_frame(
         });
         pass.set_pipeline(&resources.pipeline);
         pass.set_bind_group(0, &resources.camera_bind_group, &[]);
-        pass.set_bind_group(1, &atlas.bind_group, &[]); // <-- novo
+        pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, resources.quad_vbuf.slice(..));
         cache.draw_all(&mut pass);
     }

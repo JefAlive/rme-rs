@@ -30,6 +30,14 @@ impl SpatialMap {
         }
     }
 
+    pub fn iter_chunks(&self) -> impl Iterator<Item = &Chunk> {
+        self.chunks.values()
+    }
+
+    pub fn iter_chunk_coords(&self) -> impl Iterator<Item = (&ChunkCoord, &Chunk)> {
+        self.chunks.iter()
+    }
+
     pub fn iter_dirty_chunks(&self) -> impl Iterator<Item = (&ChunkCoord, &Chunk)> {
         self.chunks.iter().filter(|(_, c)| c.dirty)
     }
