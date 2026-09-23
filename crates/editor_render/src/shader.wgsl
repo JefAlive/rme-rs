@@ -8,7 +8,7 @@ struct Camera {
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
-@group(1) @binding(0) var atlas_tex: texture_2d_array<f32>;
+@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
 @group(1) @binding(1) var atlas_sampler: sampler;
 
 struct AnimEntry {
@@ -77,9 +77,15 @@ fn resolve_layer(anim_id: u32, seed_pos: vec2<f32>) -> u32 {
     return anim_frames[frame_idx];
 }
 
+const ATLAS_SIZE: f32 = 4096.0;
+const ATLAS_COLS: u32 = 128u;
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let layer = resolve_layer(in.anim_id, in.world_pos);
-    let sampled = textureSample(atlas_tex, atlas_sampler, in.uv, i32(layer)) * in.tint;
+    let slot = resolve_layer(in.anim_id, in.world_pos);
+    let col = f32(slot % ATLAS_COLS);
+    let row = f32(slot / ATLAS_COLS);
+    let atlas_uv = (vec2<f32>(col, row) + in.uv) * (32.0 / ATLAS_SIZE);
+    let sampled = textureSample(atlas_tex, atlas_sampler, atlas_uv) * in.tint;
     return vec4<f32>(sampled.rgb, sampled.a * camera.floor_alpha);
 }

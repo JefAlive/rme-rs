@@ -1,25 +1,38 @@
-/// Sprite atlas textura em array 2D com crescimento dinâmico.
+use ahash::AHashMap;
+
+pub const ATLAS_SIZE: u32 = 4096;
+pub const SPRITE_SIZE: u32 = 32;
+pub const ATLAS_COLS: u32 = ATLAS_SIZE / SPRITE_SIZE; // 128
+pub const ATLAS_SLOTS: u32 = ATLAS_COLS * ATLAS_COLS; // 16384
+
+/// Dynamic 2D sprite atlas.
 ///
-/// Cada camada contém um quadrado 32×32 de pixels RGBA.
-/// O atlas cresce automaticamente quando necessário (dobrando a capacidade).
+/// Textura 2D (4096×4096) alocada na GPU dividida em slots 32×32.
+/// Mantém um cache em memória `sprite_id -> slot`. Se encher, sobrescreve o mais antigo (FIFO).
 pub struct SpriteAtlas {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_layout: wgpu::BindGroupLayout,
     texture: wgpu::Texture,
-    cells: Vec<[u8; 32 * 32 * 4]>,
-    capacity: u32,
-    max_layers: u32,
+    sprite_to_slot: AHashMap<u32, u32>,
+    slot_to_sprite: Vec<u32>,
+    next_slot: u32,
+    total_slots: u32,
+    cols: u32,
 }
 
 impl SpriteAtlas {
-    /// Cria um atlas vazio com 1 camada (transparente).
+    /// Cria o dynamic atlas 2D na GPU (slot 0 reservado como transparente).
     pub fn new(device: &wgpu::Device) -> Self {
-        let max_layers = device.limits().max_texture_array_layers.max(1);
-        let capacity = 1;
-        let cells = vec![[0u8; 32 * 32 * 4]]; // camada 0 transparente
+        let total_slots = ATLAS_SLOTS;
+        let cols = ATLAS_COLS;
+
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sprite_atlas"),
-            size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: capacity },
+            label: Some("sprite_atlas_2d"),
+            size: wgpu::Extent3d {
+                width: ATLAS_SIZE,
+                height: ATLAS_SIZE,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -29,7 +42,8 @@ impl SpriteAtlas {
         });
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            label: Some("sprite_atlas_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2),
             ..Default::default()
         });
 
@@ -44,16 +58,18 @@ impl SpriteAtlas {
             label: Some("atlas_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
                 },
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
@@ -61,113 +77,104 @@ impl SpriteAtlas {
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("atlas_bg"), layout: &bind_group_layout,
+            label: Some("atlas_bg"),
+            layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
 
-        Self { bind_group, bind_group_layout, texture, cells, capacity, max_layers }
+        let slot_to_sprite = vec![0u32; total_slots as usize];
+        let sprite_to_slot = AHashMap::new();
+
+        Self {
+            bind_group,
+            bind_group_layout,
+            texture,
+            sprite_to_slot,
+            slot_to_sprite,
+            next_slot: 1, // slot 0 reservado transparente/vazio
+            total_slots,
+            cols,
+        }
     }
 
-    /// Retorna o número atual de camadas (sprites) no atlas.
-    pub fn layer_count(&self) -> u32 {
-        self.cells.len() as u32
+    /// Retorna a posição do sprite no atlas se já estiver em cache.
+    pub fn get_slot(&self, sprite_id: u32) -> Option<u32> {
+        if sprite_id == 0 {
+            return Some(0);
+        }
+        self.sprite_to_slot.get(&sprite_id).copied()
     }
 
-    /// Limite máximo de camadas (textura array) conforme o GPU.
-    pub fn max_layers(&self) -> u32 {
-        self.max_layers
-    }
-
-    /// Anexa uma nova célula RGBA (32×32) ao atlas, retornando o índice da camada.
-    /// O atlas cresce até `max_layers`; após cheio, retorna 0 (transparente).
-    pub fn append(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8; 32 * 32 * 4]) -> u32 {
-        let layer = self.cells.len() as u32;
-
-        if layer >= self.max_layers {
-            return 0; // atlas cheio — devolve camada transparente
+    /// Aloca um slot para o sprite e grava seus pixels na textura GPU via `queue.write_texture`.
+    /// Se o atlas encher, o slot mais antigo é sobrescrito (ring buffer / FIFO).
+    pub fn insert(&mut self, queue: &wgpu::Queue, sprite_id: u32, rgba: &[u8; 32 * 32 * 4]) -> u32 {
+        if sprite_id == 0 {
+            return 0;
+        }
+        if let Some(&slot) = self.sprite_to_slot.get(&sprite_id) {
+            return slot;
         }
 
-        if layer == self.capacity {
-            let new_cap = self.capacity.checked_mul(2).unwrap_or(self.max_layers)
-                .min(self.max_layers)
-                .max(1);
-            if new_cap <= self.capacity {
-                return 0;
-            }
-
-            let new_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sprite_atlas"),
-                size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: new_cap },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            // Copiar células existentes para a nova textura
-            for (i, &cell) in self.cells.iter().enumerate() {
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &new_texture, mip_level: 0,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &cell,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(32 * 4),
-                        rows_per_image: Some(32),
-                    },
-                    wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
-                );
-            }
-
-            let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            });
-
-            let new_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("atlas_sampler"),
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                ..Default::default()
-            });
-
-            self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("atlas_bg"), layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&new_sampler) },
-                ],
-            });
-
-            self.texture = new_texture;
-            self.capacity = new_cap;
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        if self.next_slot >= self.total_slots {
+            self.next_slot = 1; // substitui os mais antigos
         }
 
-        self.cells.push(*rgba);
+        // Se o slot já possuía outro sprite, remove do mapa
+        let old_sprite = self.slot_to_sprite[slot as usize];
+        if old_sprite != 0 && old_sprite != sprite_id {
+            self.sprite_to_slot.remove(&old_sprite);
+        }
+        self.slot_to_sprite[slot as usize] = sprite_id;
+        self.sprite_to_slot.insert(sprite_id, slot);
+
+        let col = slot % self.cols;
+        let row = slot / self.cols;
 
         queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: &self.texture, mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: col * SPRITE_SIZE,
+                    y: row * SPRITE_SIZE,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(32 * 4),
-                rows_per_image: Some(32),
+                bytes_per_row: Some(SPRITE_SIZE * 4),
+                rows_per_image: Some(SPRITE_SIZE),
             },
-            wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: SPRITE_SIZE,
+                height: SPRITE_SIZE,
+                depth_or_array_layers: 1,
+            },
         );
 
-        layer
+        slot
+    }
+
+    /// Retorna a quantidade de sprites atualmente mantidos em cache.
+    pub fn layer_count(&self) -> u32 {
+        self.sprite_to_slot.len().max(1) as u32
+    }
+
+    /// Total de slots disponíveis no atlas 2D.
+    pub fn max_layers(&self) -> u32 {
+        self.total_slots
     }
 }

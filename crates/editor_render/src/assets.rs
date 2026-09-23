@@ -20,6 +20,7 @@ struct DecodedSheet {
 struct DecodedSpriteCell {
     rgba: [u8; 32 * 32 * 4],
     sheet_file: String,
+    #[allow(dead_code)]
     layout: editor_formats::catalog::SpriteLayout,
     cell_x: usize,
     cell_y: usize,
@@ -47,12 +48,10 @@ pub struct SpriteResolver {
     catalog: Catalog,
     assets_dir: PathBuf,
     sheet_cache: AHashMap<u32, Arc<DecodedSheet>>,
-    sprite_layer: AHashMap<u32, u32>,
     anim_cache: AHashMap<u16, u32>,
     resolved: u64,
     cache_hits: u64,
     decode_failures: u64,
-    atlas_full: u32,
 }
 
 impl SpriteResolver {
@@ -74,9 +73,8 @@ impl SpriteResolver {
         Ok(Self {
             table, catalog, assets_dir,
             sheet_cache: AHashMap::new(),
-            sprite_layer: AHashMap::new(),
             anim_cache: AHashMap::new(),
-            resolved: 0, cache_hits: 0, decode_failures: 0, atlas_full: 0,
+            resolved: 0, cache_hits: 0, decode_failures: 0,
         })
     }
 
@@ -157,12 +155,12 @@ impl SpriteResolver {
             AnimSpec::Animated { sprite_ids, duration_ms, async_animation } => {
                 let mut frame_layers = Vec::with_capacity(sprite_ids.len());
                 for sprite_id in sprite_ids {
-                    frame_layers.push(self.resolve_sprite_layer(device, queue, atlas, sprite_id));
+                    frame_layers.push(self.resolve_sprite_layer(queue, atlas, sprite_id));
                 }
                 anim_table.push_animated(device, queue, &frame_layers, duration_ms, async_animation)
             }
             AnimSpec::Static(sprite_id) => {
-                let layer = self.resolve_sprite_layer(device, queue, atlas, sprite_id);
+                let layer = self.resolve_sprite_layer(queue, atlas, sprite_id);
                 anim_table.push_static(device, queue, layer)
             }
         };
@@ -172,31 +170,26 @@ impl SpriteResolver {
     }
 
     fn resolve_sprite_layer(
-        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        &mut self, queue: &wgpu::Queue,
         atlas: &mut SpriteAtlas, sprite_id: u32,
     ) -> u32 {
         if sprite_id == 0 { return 0; }
-        if let Some(&layer) = self.sprite_layer.get(&sprite_id) {
+        if let Some(slot) = atlas.get_slot(sprite_id) {
             self.cache_hits += 1;
-            return layer;
+            eprintln!("[atlas] sprite {sprite_id} veio do cache (slot {slot})");
+            return slot;
         }
         let Some(cell) = self.decode_sprite_cell(sprite_id) else {
             self.decode_failures += 1;
             return 0;
         };
-        let layer = atlas.append(device, queue, &cell.rgba);
-        if layer == 0 {
-            self.atlas_full += 1;
-            eprintln!("sprite resolver: atlas cheio (max_layers={}) sprite_id={sprite_id}", atlas.max_layers());
-            return 0;
-        }
-        self.sprite_layer.insert(sprite_id, layer);
+        let slot = atlas.insert(queue, sprite_id, &cell.rgba);
         self.resolved += 1;
         eprintln!(
-            "sprite resolver: sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) layer={layer}",
-            cell.sheet_file, cell.layout, cell.cell_x, cell.cell_y,
+            "[atlas] sprite {sprite_id} carregado para o atlas (slot {slot}) | sheet={} cell=({},{})",
+            cell.sheet_file, cell.cell_x, cell.cell_y,
         );
-        layer
+        slot
     }
 
     fn decode_sprite_cell(&mut self, sprite_id: u32) -> Option<DecodedSpriteCell> {
