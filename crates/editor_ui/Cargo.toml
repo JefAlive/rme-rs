@@ -8,3 +8,4 @@ editor_render = { path = "../editor_render" }
 egui      = { workspace = true }
 eframe    = { workspace = true }
 egui_dock = { workspace = true }
+egui-wgpu = { workspace = true }

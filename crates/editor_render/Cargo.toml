@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+editor_core = { path = "../editor_core" }
+wgpu       = { workspace = true }
+bytemuck   = { workspace = true }
+egui       = { workspace = true }
+egui-wgpu  = { workspace = true }
+ahash      = { workspace = true }

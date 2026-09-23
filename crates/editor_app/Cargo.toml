@@ -9,7 +9,7 @@ path = "src/main.rs"
 [dependencies]
 editor_core = { path = "../../crates/editor_core" }
 editor_ui   = { path = "../../crates/editor_ui" }
-egui      = { workspace = true }
-eframe    = { workspace = true }
-egui_dock = { workspace = true }
-env_logger = "0.11.11"
+egui        = { workspace = true }
+eframe      = { workspace = true, default-features = false, features = ["wgpu", "default_fonts"] }
+egui_dock   = { workspace = true }
+env_logger  = "0.11.11"

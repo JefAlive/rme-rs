@@ -76,6 +76,13 @@ pub struct AppState {
     pub current_floor_display: u8,
     pub hover_info: HoverInfo,
     pub log_lines: Vec<String>,
+
+    pub wgpu: Option<egui_wgpu::RenderState>,
+    pub tile_resources: Option<editor_render::pipeline::TileRenderResources>,
+    pub offscreen: Option<editor_render::offscreen::OffscreenTarget>,
+    pub chunk_cache: editor_render::scene::ChunkGpuCache,
+    pub camera_offset: egui::Vec2,
+    pub camera_zoom: f32,
 }
 
 impl Default for AppState {
@@ -103,6 +110,12 @@ impl Default for AppState {
             current_floor_display: editor_core::position::GROUND_FLOOR,
             hover_info: HoverInfo::default(),
             log_lines: Vec::new(),
+            wgpu: None,
+            tile_resources: None,
+            offscreen: None,
+            chunk_cache: Default::default(),
+            camera_offset: egui::Vec2::ZERO,
+            camera_zoom: 1.0
         }
     }
 }
@@ -176,42 +189,92 @@ impl<'a> egui_dock::TabViewer for EditorTabViewer<'a> {
 impl<'a> EditorTabViewer<'a> {
     fn ui_viewport(&mut self, ui: &mut Ui, doc_index: usize) {
         let avail = ui.available_size();
-        let (rect, _resp) = ui.allocate_exact_size(
+        let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(avail.x, avail.y - 26.0), egui::Sense::click_and_drag(),
         );
-        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 24, 20));
-        ui.painter().text(
-            rect.center(), egui::Align2::CENTER_CENTER,
-            "VIEWPORT (wgpu offscreen texture aqui)",
-            egui::FontId::proportional(14.0), egui::Color32::GRAY,
-        );
 
-        egui::Area::new(egui::Id::new(("floor_selector", doc_index)))
-            .fixed_pos(rect.right_top() + egui::vec2(-40.0, 20.0))
-            .show(ui.ctx(), |ui| {
-                for (z, label) in (0..=14).zip(
-                    ["+7","+6","+5","+4","+3","+2","+1","0","-1","-2","-3","-4","-5","-6","-7"]
-                ) {
-                    let selected = z == self.state.current_floor_display;
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.state.current_floor_display = z;
-                    }
+        if resp.dragged() {
+            self.state.camera_offset -= resp.drag_delta() / self.state.camera_zoom;
+        }
+
+        if let Some(wgpu_state) = self.state.wgpu.clone() {
+            let device = &wgpu_state.device;
+            let queue = &wgpu_state.queue;
+
+            if self.state.tile_resources.is_none() {
+                self.state.tile_resources = Some(
+                    editor_render::pipeline::TileRenderResources::new(device, editor_render::offscreen::OFFSCREEN_FORMAT)
+                );
+            }
+
+            let width = rect.width().max(1.0) as u32;
+            let height = rect.height().max(1.0) as u32;
+            {
+                let mut renderer = wgpu_state.renderer.write();
+                match &mut self.state.offscreen {
+                    Some(target) => target.resize_if_needed(device, &mut renderer, width, height),
+                    None => self.state.offscreen = Some(
+                        editor_render::offscreen::OffscreenTarget::create(device, &mut renderer, width, height)
+                    ),
                 }
-            });
+            }
 
+            let doc = &mut self.state.documents[doc_index];
+            self.state.chunk_cache.sync(device, &mut doc.map);
+
+            let camera = editor_render::pipeline::CameraUniform {
+                offset: [self.state.camera_offset.x, self.state.camera_offset.y],
+                zoom: self.state.camera_zoom,
+                _pad: 0.0,
+                viewport_size: [width as f32, height as f32],
+                _pad2: [0.0, 0.0],
+            };
+            editor_render::scene::render_frame(
+                device, queue,
+                self.state.tile_resources.as_ref().unwrap(),
+                &self.state.chunk_cache,
+                self.state.offscreen.as_ref().unwrap(),
+                camera,
+            );
+
+            let id = self.state.offscreen.as_ref().unwrap().id;
+            ui.painter().image(
+                id, rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(60, 0, 0));
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+                "wgpu render state indisponível", egui::FontId::default(), egui::Color32::WHITE);
+        }
+
+        // clique pinta um tile — mesma lógica de antes, agora convertendo
+        // coordenada de tela -> mundo considerando pan/zoom
+        if resp.clicked() {
+            if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                let local = pos - rect.min;
+                let tile_x = ((local.x / self.state.camera_zoom + self.state.camera_offset.x) / 32.0).floor() as u16;
+                let tile_y = ((local.y / self.state.camera_zoom + self.state.camera_offset.y) / 32.0).floor() as u16;
+                let world_pos = editor_core::position::Position {
+                    x: tile_x, y: tile_y, z: self.state.current_floor_display,
+                };
+                let doc = &mut self.state.documents[doc_index];
+                let mut tx = doc.begin_transaction("Paint");
+                tx.record_before(doc, world_pos);
+                let mut tile = doc.map.get_tile(world_pos).cloned().unwrap_or_default();
+                tile.ground = Some(editor_core::item::Item::new(4526));
+                tx.set_after(world_pos, tile);
+                tx.commit(doc);
+            }
+        }
+
+        // status bar (igual ao que já tínhamos)
         ui.horizontal(|ui| {
             let h = &self.state.hover_info;
             ui.label(format!("Position: [{}, {}, {}]", h.x, h.y, h.z));
             ui.separator();
-            ui.label(if h.item_id > 0 { format!("ItemId: {}", h.item_id) } else { "ItemId: -".into() });
-            ui.separator();
-            ui.label(format!("Name: {}", if h.item_name.is_empty() { "Nothing" } else { &h.item_name }));
-            ui.separator();
-            ui.label("Navigation: WASD");
-            ui.separator();
-            ui.label("Change Floors: Q & E");
-            ui.separator();
-            ui.label(format!("Zoom: {}%", self.state.current_zoom));
+            ui.label(format!("Zoom: {}%", (self.state.camera_zoom * 100.0) as i32));
         });
     }
 
