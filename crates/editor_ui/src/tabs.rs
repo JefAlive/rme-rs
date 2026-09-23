@@ -83,6 +83,7 @@ pub struct AppState {
     pub chunk_cache: editor_render::scene::ChunkGpuCache,
     pub camera_offset: egui::Vec2,
     pub camera_zoom: f32,
+    pub atlas: Option<editor_render::atlas::SpriteAtlas>,
 }
 
 impl Default for AppState {
@@ -115,7 +116,8 @@ impl Default for AppState {
             offscreen: None,
             chunk_cache: Default::default(),
             camera_offset: egui::Vec2::ZERO,
-            camera_zoom: 1.0
+            camera_zoom: 1.0,
+            atlas: None
         }
     }
 }
@@ -202,9 +204,13 @@ impl<'a> EditorTabViewer<'a> {
             let queue = &wgpu_state.queue;
 
             if self.state.tile_resources.is_none() {
-                self.state.tile_resources = Some(
-                    editor_render::pipeline::TileRenderResources::new(device, editor_render::offscreen::OFFSCREEN_FORMAT)
-                );
+                if let Some(atlas) = &self.state.atlas {
+                    self.state.tile_resources = Some(
+                        editor_render::pipeline::TileRenderResources::new(
+                            device, editor_render::offscreen::OFFSCREEN_FORMAT, &atlas.bind_group_layout,
+                        )
+                    );
+                }
             }
 
             let width = rect.width().max(1.0) as u32;
@@ -229,13 +235,12 @@ impl<'a> EditorTabViewer<'a> {
                 viewport_size: [width as f32, height as f32],
                 _pad2: [0.0, 0.0],
             };
-            editor_render::scene::render_frame(
-                device, queue,
-                self.state.tile_resources.as_ref().unwrap(),
-                &self.state.chunk_cache,
-                self.state.offscreen.as_ref().unwrap(),
-                camera,
-            );
+            if let (Some(resources), Some(atlas)) = (&self.state.tile_resources, &self.state.atlas) {
+                editor_render::scene::render_frame(
+                    device, queue, resources, &self.state.chunk_cache, atlas,
+                    self.state.offscreen.as_ref().unwrap(), camera,
+                );
+            }
 
             let id = self.state.offscreen.as_ref().unwrap().id;
             ui.painter().image(
@@ -263,7 +268,8 @@ impl<'a> EditorTabViewer<'a> {
                 let mut tx = doc.begin_transaction("Paint");
                 tx.record_before(doc, world_pos);
                 let mut tile = doc.map.get_tile(world_pos).cloned().unwrap_or_default();
-                tile.ground = Some(editor_core::item::Item::new(4526));
+                let sprite_id = self.state.atlas.as_ref().map(|a| 1 + (42 % a.layer_count)).unwrap_or(1);
+                tile.ground = Some(editor_core::item::Item::new(sprite_id as u16));
                 tx.set_after(world_pos, tile);
                 tx.commit(doc);
             }

@@ -1,16 +1,16 @@
 use bytemuck::{Pod, Zeroable};
 
-/// v0 deliberadamente mínimo: cor sólida, sem atlas/layer/anim ainda.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct TileInstance {
     pub world_pos: [f32; 2],
-    pub color: [f32; 4],
+    pub layer_index: u32,
+    pub tint: [f32; 4], // branco = sem tingimento; usado depois p/ zonas (PZ/PVP/etc)
 }
 
 impl TileInstance {
-    const ATTRS: [wgpu::VertexAttribute; 2] =
-        wgpu::vertex_attr_array![1 => Float32x2, 2 => Float32x4];
+    const ATTRS: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![1 => Float32x2, 2 => Uint32, 3 => Float32x4];
 
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {

@@ -10,7 +10,8 @@ path = "src/main.rs"
 editor_core   = { path = "../editor_core" }
 editor_ui     = { path = "../editor_ui" }
 editor_render = { path = "../editor_render" }
+editor_formats = { path = "../editor_formats" }
 egui          = { workspace = true }
-eframe        = { workspace = true, default-features = false, features = ["wgpu", "default_fonts"] }
+eframe        = { workspace = true, features = ["wgpu"] }
 egui_dock     = { workspace = true }
 env_logger    = "0.11"

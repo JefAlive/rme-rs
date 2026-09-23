@@ -26,7 +26,8 @@ impl ChunkGpuCache {
                     if let Some(ground) = &tile.ground {
                         instances.push(TileInstance {
                             world_pos: [pos.x as f32, pos.y as f32],
-                            color: color_from_type_id(ground.type_id),
+                            layer_index: ground.type_id as u32, // v0: type_id JÁ É o sprite id direto
+                            tint: [1.0, 1.0, 1.0, 1.0],
                         });
                     }
                 }
@@ -50,11 +51,6 @@ impl ChunkGpuCache {
     }
 }
 
-fn color_from_type_id(id: u16) -> [f32; 4] {
-    let h = (id as u32).wrapping_mul(2654435761);
-    [((h >> 16) & 0xFF) as f32 / 255.0, ((h >> 8) & 0xFF) as f32 / 255.0, (h & 0xFF) as f32 / 255.0, 1.0]
-}
-
 /// Isto é o "render-to-texture" propriamente dito: encoder próprio,
 /// render pass mirando a OffscreenTarget, submit próprio.
 pub fn render_frame(
@@ -62,31 +58,24 @@ pub fn render_frame(
     queue: &wgpu::Queue,
     resources: &TileRenderResources,
     cache: &ChunkGpuCache,
+    atlas: &crate::atlas::SpriteAtlas,
     target: &OffscreenTarget,
     camera: CameraUniform,
 ) {
     queue.write_buffer(&resources.camera_buf, 0, bytemuck::cast_slice(&[camera]));
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("viewport_encoder"),
-    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport_encoder") });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("viewport_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.05, b: 0.03, a: 1.0 }),
-                    store: wgpu::StoreOp::Store,
-                },
+                view: &target.view, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.05, b: 0.03, a: 1.0 }), store: wgpu::StoreOp::Store },
             })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
+            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
         });
         pass.set_pipeline(&resources.pipeline);
         pass.set_bind_group(0, &resources.camera_bind_group, &[]);
+        pass.set_bind_group(1, &atlas.bind_group, &[]); // <-- novo
         pass.set_vertex_buffer(0, resources.quad_vbuf.slice(..));
         cache.draw_all(&mut pass);
     }

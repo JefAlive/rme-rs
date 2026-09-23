@@ -20,7 +20,7 @@ pub struct CameraUniform {
 
 impl TileRenderResources {
     /// `target_format` precisa ser o formato da textura OFFSCREEN, não o da swapchain.
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, atlas_bgl: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -33,38 +33,31 @@ impl TileRenderResources {
             mapped_at_creation: false,
         });
 
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let camera_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("camera_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
+                binding: 0, visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             }],
         });
 
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera_bg"),
-            layout: &bgl,
+            label: Some("camera_bg"), layout: &camera_bgl,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() }],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tile_pipeline_layout"),
-            bind_group_layouts: &[&bgl],
+            bind_group_layouts: &[&camera_bgl, atlas_bgl], // group(0)=câmera, group(1)=atlas
             push_constant_ranges: &[],
         });
 
         let quad_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad_vbuf"),
-            contents: bytemuck::cast_slice(&[[0.0f32, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+            contents: bytemuck::cast_slice(&[[0.0f32,0.0],[1.0,0.0],[0.0,1.0],[1.0,1.0]]),
             usage: wgpu::BufferUsages::VERTEX,
         });
-
         let quad_layout = wgpu::VertexBufferLayout {
             array_stride: 8,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -75,14 +68,12 @@ impl TileRenderResources {
             label: Some("tile_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
+                module: &shader, entry_point: "vs_main",
                 buffers: &[quad_layout, TileInstance::layout()],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
+                module: &shader, entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -90,10 +81,7 @@ impl TileRenderResources {
                 })],
                 compilation_options: Default::default(),
             }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview: None,

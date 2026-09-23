@@ -1,3 +1,4 @@
+// crates/editor_render/src/shader.wgsl — substituir por completo
 struct Camera {
     offset: vec2<f32>,
     zoom: f32,
@@ -7,15 +8,21 @@ struct Camera {
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
+@group(1) @binding(0) var atlas_tex: texture_2d_array<f32>;
+@group(1) @binding(1) var atlas_sampler: sampler;
+
 struct VsIn {
-    @location(0) quad_pos: vec2<f32>,   // unit quad: (0,0)(1,0)(0,1)(1,1)
-    @location(1) world_pos: vec2<f32>,  // posição do tile em SQMs
-    @location(2) color: vec4<f32>,
+    @location(0) quad_pos: vec2<f32>,
+    @location(1) world_pos: vec2<f32>,
+    @location(2) layer_index: u32,
+    @location(3) tint: vec4<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) color: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) layer: u32,
+    @location(2) tint: vec4<f32>,
 };
 
 const TILE_SIZE: f32 = 32.0;
@@ -29,11 +36,13 @@ fn vs_main(in: VsIn) -> VsOut {
     );
     var out: VsOut;
     out.clip_pos = vec4<f32>(ndc, 0.0, 1.0);
-    out.color = in.color;
+    out.uv = in.quad_pos;
+    out.layer = in.layer_index;
+    out.tint = in.tint;
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return in.color;
+    return textureSample(atlas_tex, atlas_sampler, in.uv, i32(in.layer)) * in.tint;
 }

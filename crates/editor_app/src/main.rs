@@ -3,8 +3,15 @@ use editor_core::{
     position::{Position, GROUND_FLOOR},
     MapDocument,
 };
+use editor_formats::spr::SpriteCatalog;
+use editor_render::atlas::SpriteAtlas;
 use editor_ui::tabs::{AppState, EditorTab, EditorTabViewer};
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
+
+const SPR_PATH: &str = "C:/Caminho/Para/Tibia.spr";
+const SPRITE_LOAD_COUNT: u32 = 256; // v0: só os primeiros N, rápido de carregar
+const SPR_EXTENDED_COUNT: bool = true; // tente `false` se a arte sair corrompida
+const SPR_HAS_ALPHA: bool = true;      // tente `false` se as cores saírem erradas
 
 struct RmeApp {
     dock_state: DockState<EditorTab>,
@@ -24,18 +31,33 @@ impl RmeApp {
         let mut state = AppState::default();
         state.wgpu = cc.wgpu_render_state.clone();
 
-        // Documento inicial com um patch 16x16 sintético, só para já
-        // aparecer algo colorido assim que a janela abrir.
+        let mut atlas_opt = None;
+        if let Some(rs) = &state.wgpu {
+            match SpriteCatalog::load(SPR_PATH, SPR_EXTENDED_COUNT, SPR_HAS_ALPHA) {
+                Ok(mut catalog) => {
+                    let n = catalog.sprite_count().min(SPRITE_LOAD_COUNT as usize).max(1);
+                    let sprites: Vec<_> = (1..=n as u32).map(|id| catalog.decode(id).unwrap_or([0u8; 32*32*4])).collect();
+                    eprintln!("[spr] {} sprites carregados de {}", sprites.len(), SPR_PATH);
+                    atlas_opt = Some(SpriteAtlas::new(&rs.device, &rs.queue, &sprites));
+                }
+                Err(e) => {
+                    eprintln!("[spr] falha ao carregar '{}': {:?} — usando atlas placeholder", SPR_PATH, e);
+                    atlas_opt = Some(SpriteAtlas::new(&rs.device, &rs.queue, &[[0u8; 32*32*4]]));
+                }
+            }
+        }
+        state.atlas = atlas_opt;
+
+        let atlas_layers = state.atlas.as_ref().map(|a| a.layer_count).unwrap_or(1);
         let mut doc = MapDocument::new("Global.otbm");
         for y in 0..16u16 {
             for x in 0..16u16 {
                 let pos = Position { x, y, z: GROUND_FLOOR };
-                let tile = doc.map.get_tile_mut(pos);
-                tile.ground = Some(Item::new(100 + ((x + y * 3) % 12)));
+                let sprite_id = 1 + ((x as u32 + y as u32 * 7) % atlas_layers.max(1));
+                doc.map.get_tile_mut(pos).ground = Some(Item::new(sprite_id as u16));
             }
         }
         state.documents.push(doc);
-        state.log_lines.push("[core] mapa sintético 16x16 semeado.".into());
 
         // Layout do dock: espelha o protótipo ImRAD.
         let mut dock_state = DockState::new(vec![EditorTab::Viewport { doc_index: 0 }]);
