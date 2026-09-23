@@ -1,0 +1,10 @@
+# Aliases de cargo, escopados a este projeto.
+#
+# Exige cargo-xwin no PATH:
+#   cargo install cargo-xwin           # instala global
+#   ./build_windows.sh                 # instala local (em .tools/) e já builda
+#
+# Uso:
+#   cargo win                          # build release pro Windows
+[alias]
+win = ["xwin", "build", "--release", "-p", "editor_app", "--target", "x86_64-pc-windows-msvc"]
