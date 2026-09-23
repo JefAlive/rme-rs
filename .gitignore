@@ -1,4 +1,10 @@
-target/
+# Cargo/Rust
 Cargo.lock
 .tools/
+
+# Reference projects used for AI
+reference/
+
+# Output directories
+target/
 dist/
