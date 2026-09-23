@@ -1,0 +1,47 @@
+{
+  // ==========================================
+  // RUST ANALYZER
+  // ==========================================
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  "rust-analyzer.check.command": "check",
+  "rust-analyzer.cargo.buildScripts.enable": true,
+  "rust-analyzer.procMacro.enable": true,
+
+  // ==========================================
+  // C++ (CLANGD para a referência RME)
+  // ==========================================
+  "clangd.arguments": [
+    "--background-index",
+    "-j=4",
+    "--completion-style=detailed",
+    "--header-insertion=never"
+  ],
+
+  // ==========================================
+  // WGSL (Shaders)
+  // ==========================================
+  "[wgsl]": {
+    "editor.formatOnSave": true
+  },
+
+  // ==========================================
+  // PERFORMANCE & EXCLUSÕES DE ARQUIVOS
+  // (Crucial para o VS Code não congelar com os assets do Tibia)
+  // ==========================================
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/.git/**": true,
+    "**/reference-assets/**": true,
+    "**/*.otbm": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/reference-assets/*.png": true,
+    "**/reference-assets/*.lzma": true,
+    "**/reference-assets/*.bmp": true,
+    "**/*.otbm": true
+  }
+}
