@@ -5,6 +5,7 @@ pub mod item;
 pub mod chunk;
 pub mod spatial_map;
 pub mod history;
+pub mod import;
 
 use position::Position;
 use spatial_map::SpatialMap;

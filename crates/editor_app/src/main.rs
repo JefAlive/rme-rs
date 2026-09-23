@@ -3,15 +3,37 @@ use editor_core::{
     position::{Position, GROUND_FLOOR},
     MapDocument,
 };
-use editor_formats::spr::SpriteCatalog;
 use editor_render::atlas::SpriteAtlas;
 use editor_ui::tabs::{AppState, EditorTab, EditorTabViewer};
 use egui_dock::{DockArea, DockState, NodeIndex, Style};
 
-const SPR_PATH: &str = "C:/Caminho/Para/Tibia.spr";
-const SPRITE_LOAD_COUNT: u32 = 256; // v0: só os primeiros N, rápido de carregar
-const SPR_EXTENDED_COUNT: bool = true; // tente `false` se a arte sair corrompida
-const SPR_HAS_ALPHA: bool = true;      // tente `false` se as cores saírem erradas
+/// Fase 0->4: atlas placeholder com alguns quadrados coloridos.
+/// A partir da Fase 4 o atlas é alimentado pelos sprites reais
+/// (appearances.dat + catalog-content.json + sheets LZMA).
+fn placeholder_sprites() -> Vec<[u8; 32 * 32 * 4]> {
+    let colors: [[u8; 4]; 4] = [
+        [220, 60, 60, 255],
+        [60, 200, 90, 255],
+        [70, 120, 230, 255],
+        [235, 215, 90, 255],
+    ];
+    colors
+        .into_iter()
+        .map(|c| {
+            let mut rgba = [0u8; 32 * 32 * 4];
+            for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+                let (cx, cy) = ((i % 32) as u8, (i / 32) as u8);
+                let light = ((cx / 8 + cy / 8) % 2 == 1) as u8;
+                let shade = if light == 1 { 0 } else { 90 };
+                px[0] = c[0].saturating_sub(shade);
+                px[1] = c[1].saturating_sub(shade);
+                px[2] = c[2].saturating_sub(shade);
+                px[3] = 255;
+            }
+            rgba
+        })
+        .collect()
+}
 
 struct RmeApp {
     dock_state: DockState<EditorTab>,
@@ -33,28 +55,18 @@ impl RmeApp {
 
         let mut atlas_opt = None;
         if let Some(rs) = &state.wgpu {
-            match SpriteCatalog::load(SPR_PATH, SPR_EXTENDED_COUNT, SPR_HAS_ALPHA) {
-                Ok(mut catalog) => {
-                    let n = catalog.sprite_count().min(SPRITE_LOAD_COUNT as usize).max(1);
-                    let sprites: Vec<_> = (1..=n as u32).map(|id| catalog.decode(id).unwrap_or([0u8; 32*32*4])).collect();
-                    eprintln!("[spr] {} sprites carregados de {}", sprites.len(), SPR_PATH);
-                    atlas_opt = Some(SpriteAtlas::new(&rs.device, &rs.queue, &sprites));
-                }
-                Err(e) => {
-                    eprintln!("[spr] falha ao carregar '{}': {:?} — usando atlas placeholder", SPR_PATH, e);
-                    atlas_opt = Some(SpriteAtlas::new(&rs.device, &rs.queue, &[[0u8; 32*32*4]]));
-                }
-            }
+            let sprites = placeholder_sprites();
+            eprintln!("atlas placeholder: {} camadas", sprites.len());
+            atlas_opt = Some(SpriteAtlas::new(&rs.device, &rs.queue, &sprites));
         }
         state.atlas = atlas_opt;
 
-        let atlas_layers = state.atlas.as_ref().map(|a| a.layer_count).unwrap_or(1);
         let mut doc = MapDocument::new("Global.otbm");
         for y in 0..16u16 {
             for x in 0..16u16 {
                 let pos = Position { x, y, z: GROUND_FLOOR };
-                let sprite_id = 1 + ((x as u32 + y as u32 * 7) % atlas_layers.max(1));
-                doc.map.get_tile_mut(pos).ground = Some(Item::new(sprite_id as u16));
+                let type_id = 1 + ((x + y * 7) % 4);
+                doc.map.get_tile_mut(pos).ground = Some(Item::new(type_id));
             }
         }
         state.documents.push(doc);

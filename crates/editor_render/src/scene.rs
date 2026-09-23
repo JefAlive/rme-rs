@@ -10,7 +10,9 @@ pub struct ChunkGpuCache {
 
 impl ChunkGpuCache {
     /// Só retesselado os chunks marcados dirty — o resto do mapa não custa nada.
-    pub fn sync(&mut self, device: &wgpu::Device, map: &mut SpatialMap) {
+    /// A resolução `type_id -> layer do atlas` fica a cargo do chamador (Fase 4);
+    /// aqui o chão vira um quad 32x32 na camada resolvida.
+    pub fn sync(&mut self, device: &wgpu::Device, map: &mut SpatialMap, resolve_layer: impl Fn(u16) -> u32) {
         let dirty: Vec<ChunkCoord> = map.iter_dirty_chunks().map(|(c, _)| *c).collect();
         for coord in dirty {
             let mut instances = Vec::with_capacity(256);
@@ -26,7 +28,7 @@ impl ChunkGpuCache {
                     if let Some(ground) = &tile.ground {
                         instances.push(TileInstance {
                             world_pos: [pos.x as f32, pos.y as f32],
-                            layer_index: ground.type_id as u32, // v0: type_id JÁ É o sprite id direto
+                            layer_index: resolve_layer(ground.type_id),
                             tint: [1.0, 1.0, 1.0, 1.0],
                         });
                     }

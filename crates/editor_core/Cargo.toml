@@ -7,3 +7,4 @@ rayon    = { workspace = true }
 smallvec = { workspace = true }
 ahash    = { workspace = true }
 bitflags = { workspace = true }
+editor_formats = { version = "0.1.0", path = "../editor_formats" }

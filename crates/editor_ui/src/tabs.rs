@@ -226,7 +226,8 @@ impl<'a> EditorTabViewer<'a> {
             }
 
             let doc = &mut self.state.documents[doc_index];
-            self.state.chunk_cache.sync(device, &mut doc.map);
+            // Fase 4+: resolver real (ItemTypeTable -> sprite id -> layer do atlas).
+            self.state.chunk_cache.sync(device, &mut doc.map, |type_id| type_id as u32);
 
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
