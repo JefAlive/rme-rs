@@ -1,7 +1,5 @@
 use editor_core::{MapDocument, position::Position, spatial_map::SpatialMap};
 use egui::{RichText, Ui};
-use editor_render::assets::SpriteResolver;
-use editor_render::atlas::SpriteAtlas;
 
 const PAN_SPEED_TILES_PER_SEC: f32 = 12.0;
 const ZOOM_MIN: f32 = 0.1;

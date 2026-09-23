@@ -11,7 +11,9 @@ use crate::atlas::SpriteAtlas;
 
 struct DecodedSheet {
     pixels_rgba: Vec<u8>,
+    #[allow(dead_code)]
     layout: editor_formats::catalog::SpriteLayout,
+    #[allow(dead_code)]
     first_id: u32,
 }
 
@@ -121,22 +123,48 @@ impl SpriteResolver {
         if let Some(&id) = self.anim_cache.get(&type_id) {
             return id;
         }
-        let Some(item_type) = self.table.get_opt(type_id) else { return 0 };
+        enum AnimSpec {
+            Animated {
+                sprite_ids: Vec<u32>,
+                duration_ms: u32,
+                async_animation: bool,
+            },
+            Static(u32),
+        }
 
-        let id = if item_type.animation_phases.len() > 1 {
-            let mut frame_layers = Vec::with_capacity(item_type.animation_phases.len());
-            for phase in 0..item_type.animation_phases.len() as u32 {
-                let idx = item_type.sprite_index(phase, 0, 0, 0, 0);
-                let sprite_id = item_type.sprite_ids.get(idx).copied().unwrap_or(0);
-                frame_layers.push(self.resolve_sprite_layer(device, queue, atlas, sprite_id));
+        let spec = {
+            let Some(item_type) = self.table.get_opt(type_id) else { return 0 };
+            if item_type.animation_phases.len() > 1 {
+                let sprite_ids: Vec<u32> = (0..item_type.animation_phases.len() as u32)
+                    .map(|phase| {
+                        let idx = item_type.sprite_index(phase, 0, 0, 0, 0);
+                        item_type.sprite_ids.get(idx).copied().unwrap_or(0)
+                    })
+                    .collect();
+                let (min, max) = item_type.animation_phases[0];
+                let duration_ms = ((min + max) / 2).max(1);
+                AnimSpec::Animated {
+                    sprite_ids,
+                    duration_ms,
+                    async_animation: item_type.async_animation,
+                }
+            } else {
+                AnimSpec::Static(item_type.sprite_ids.first().copied().unwrap_or(0))
             }
-            let (min, max) = item_type.animation_phases[0];
-            let duration_ms = ((min + max) / 2).max(1);
-            anim_table.push_animated(device, queue, &frame_layers, duration_ms, item_type.async_animation)
-        } else {
-            let sprite_id = item_type.sprite_ids.first().copied().unwrap_or(0);
-            let layer = self.resolve_sprite_layer(device, queue, atlas, sprite_id);
-            anim_table.push_static(device, queue, layer)
+        };
+
+        let id = match spec {
+            AnimSpec::Animated { sprite_ids, duration_ms, async_animation } => {
+                let mut frame_layers = Vec::with_capacity(sprite_ids.len());
+                for sprite_id in sprite_ids {
+                    frame_layers.push(self.resolve_sprite_layer(device, queue, atlas, sprite_id));
+                }
+                anim_table.push_animated(device, queue, &frame_layers, duration_ms, async_animation)
+            }
+            AnimSpec::Static(sprite_id) => {
+                let layer = self.resolve_sprite_layer(device, queue, atlas, sprite_id);
+                anim_table.push_static(device, queue, layer)
+            }
         };
 
         self.anim_cache.insert(type_id, id);

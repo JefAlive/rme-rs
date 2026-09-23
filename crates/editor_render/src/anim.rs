@@ -27,8 +27,8 @@ pub struct AnimTable {
     pub bind_group: wgpu::BindGroup,
 }
 
-const INITIAL_ENTRIES_CAP: u32 = 64;
-const INITIAL_FRAMES_CAP: u32 = 256;
+pub const INITIAL_ENTRIES_CAP: u32 = 8192;
+pub const INITIAL_FRAMES_CAP: u32 = 32768;
 
 impl AnimTable {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {

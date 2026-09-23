@@ -185,9 +185,19 @@ impl eframe::App for RmeApp {
 fn main() -> eframe::Result<()> {
     env_logger::init();
 
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.device_descriptor = std::sync::Arc::new(|adapter: &wgpu::Adapter| {
+        wgpu::DeviceDescriptor {
+            label: Some("rme_device"),
+            required_features: adapter.features(),
+            required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::default(),
+        }
+    });
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1400.0, 860.0]),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         ..Default::default()
     };
 

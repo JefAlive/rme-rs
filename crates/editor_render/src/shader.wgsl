@@ -17,8 +17,11 @@ struct AnimEntry {
     frame_duration_ms: u32,
     mode: u32,
 };
-@group(2) @binding(0) var<storage, read> anim_entries: array<AnimEntry>;
-@group(2) @binding(1) var<storage, read> anim_frames: array<u32>;
+const MAX_ANIM_ENTRIES: u32 = 8192u;
+const MAX_ANIM_FRAMES: u32 = 32768u;
+
+@group(2) @binding(0) var<storage, read> anim_entries: array<AnimEntry, 8192>;
+@group(2) @binding(1) var<storage, read> anim_frames: array<u32, 32768>;
 
 struct VsIn {
     @location(0) quad_pos: vec2<f32>,
@@ -59,9 +62,10 @@ fn hash(p: vec2<f32>) -> f32 {
 }
 
 fn resolve_layer(anim_id: u32, seed_pos: vec2<f32>) -> u32 {
-    let entry = anim_entries[anim_id];
+    let safe_anim_id = min(anim_id, MAX_ANIM_ENTRIES - 1u);
+    let entry = anim_entries[safe_anim_id];
     if (entry.frame_count <= 1u) {
-        return anim_frames[entry.first_frame];
+        return anim_frames[min(entry.first_frame, MAX_ANIM_FRAMES - 1u)];
     }
     var t = u32(camera.time_ms);
     if (entry.mode == 1u) {
@@ -69,7 +73,8 @@ fn resolve_layer(anim_id: u32, seed_pos: vec2<f32>) -> u32 {
         t = t + phase;
     }
     let frame = (t / entry.frame_duration_ms) % entry.frame_count;
-    return anim_frames[entry.first_frame + frame];
+    let frame_idx = min(entry.first_frame + frame, MAX_ANIM_FRAMES - 1u);
+    return anim_frames[frame_idx];
 }
 
 @fragment
