@@ -1,5 +1,11 @@
 use editor_core::{MapDocument, position::Position, spatial_map::SpatialMap};
 use egui::{RichText, Ui};
+use editor_render::assets::SpriteResolver;
+use editor_render::atlas::SpriteAtlas;
+
+const PAN_SPEED_TILES_PER_SEC: f32 = 12.0;
+const ZOOM_MIN: f32 = 0.1;
+const ZOOM_MAX: f32 = 8.0;
 
 /// Bounding box dos tiles com chão no andar informado (para a câmera).
 fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16)> {
@@ -38,6 +44,22 @@ fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16
     } else {
         None
     }
+}
+
+/// Espelha a regra de composição multi-andar do RME (SetupVars/DrawMap):
+/// no térreo ou acima (floor <= 7), a pilha vai do térreo (7) até o telhado
+/// mais alto (0); no subsolo (floor > 7), desenha até 2 andares abaixo do
+/// atual. Retorna (start_z, end_z = floor, superend_z).
+fn compute_floor_stack(current_floor: u8) -> (u8, u8, u8) {
+    let ground = editor_core::position::GROUND_FLOOR;
+    let max_z = editor_core::position::MAP_MAX_Z;
+    let start_z = if current_floor < 8 {
+        ground
+    } else {
+        (current_floor + 2).min(max_z)
+    };
+    let superend_z = if current_floor > ground { 8 } else { 0 };
+    (start_z, current_floor, superend_z)
 }
 
 pub enum EditorTab {
@@ -89,7 +111,6 @@ pub struct AppState {
     pub documents: Vec<MapDocument>,
     pub active_doc: usize,
 
-    // Grupos de brush — cada um independente, nenhum interfere no outro.
     pub selection_brush: Option<SelectionBrush>,
     pub zone_brush: Option<ZoneBrush>,
     pub door_brush: Option<DoorBrush>,
@@ -99,11 +120,9 @@ pub struct AppState {
     pub brush_thickness: i32,
     pub brush_size: i32,
 
-    // Filtros do painel Objects
     pub city_filter: String,
     pub item_name_filter: String,
 
-    // World settings
     pub world_light: u8,
     pub show_tooltips: bool,
     pub show_npcs: bool,
@@ -123,9 +142,7 @@ pub struct AppState {
     pub camera_offset: egui::Vec2,
     pub camera_zoom: f32,
     pub atlas: Option<editor_render::atlas::SpriteAtlas>,
-    /// Resolvedor de sprites (type_id → layer do atlas).
     pub sprite_resolver: Option<editor_render::assets::SpriteResolver>,
-    /// Se true, a câmera será centralizada no bbox do mapa no primeiro frame.
     pub camera_fit_pending: bool,
 }
 
@@ -174,8 +191,6 @@ pub struct HoverInfo {
     pub item_name: String,
 }
 
-/// Helper genérico: botão que participa de um grupo de seleção única,
-/// sem afetar nenhum outro grupo.
 fn radio_button<T: PartialEq + Copy>(ui: &mut Ui, current: &mut Option<T>, value: T, label: &str) {
     let selected = *current == Some(value);
     if ui.selectable_label(selected, label).clicked() {
@@ -244,6 +259,48 @@ impl<'a> EditorTabViewer<'a> {
             self.state.camera_offset -= resp.drag_delta() / self.state.camera_zoom;
         }
 
+        // --- Navegação: zoom no scroll (ancorado no cursor), pan WASD, andar Q/E ---
+        if resp.hovered() {
+            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll_y != 0.0 {
+                if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    let local = hover_pos - rect.min;
+                    let old_zoom = self.state.camera_zoom;
+                    let new_zoom = (old_zoom * (1.0 + scroll_y * 0.001)).clamp(ZOOM_MIN, ZOOM_MAX);
+                    if (new_zoom - old_zoom).abs() > f32::EPSILON {
+                        // Mantém o ponto do mundo sob o cursor fixo ao zoomar.
+                        self.state.camera_offset.x += local.x * (1.0 / old_zoom - 1.0 / new_zoom);
+                        self.state.camera_offset.y += local.y * (1.0 / old_zoom - 1.0 / new_zoom);
+                        self.state.camera_zoom = new_zoom;
+                    }
+                }
+            }
+
+            let dt = ui.input(|i| i.stable_dt);
+            let mut dir = egui::Vec2::ZERO;
+            ui.input(|i| {
+                if i.key_down(egui::Key::W) { dir.y -= 1.0; }
+                if i.key_down(egui::Key::S) { dir.y += 1.0; }
+                if i.key_down(egui::Key::A) { dir.x -= 1.0; }
+                if i.key_down(egui::Key::D) { dir.x += 1.0; }
+            });
+            if dir != egui::Vec2::ZERO {
+                let world_px_per_sec = PAN_SPEED_TILES_PER_SEC * 32.0;
+                self.state.camera_offset += dir.normalized() * world_px_per_sec * dt;
+            }
+
+            if ui.input(|i| i.key_pressed(egui::Key::Q)) {
+                self.state.current_floor_display =
+                    (self.state.current_floor_display + 1).min(editor_core::position::MAP_MAX_Z);
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::E)) {
+                self.state.current_floor_display = self.state.current_floor_display.saturating_sub(1);
+            }
+
+            // WASD precisa de repaint contínuo enquanto a tecla está segurada.
+            ui.ctx().request_repaint();
+        }
+
         if let Some(wgpu_state) = self.state.wgpu.clone() {
             let device = &wgpu_state.device;
             let queue = &wgpu_state.queue;
@@ -271,21 +328,27 @@ impl<'a> EditorTabViewer<'a> {
             }
 
             let floor = self.state.current_floor_display;
+            let (start_z, end_z, superend_z) = compute_floor_stack(floor);
 
-            // Extrai sprite_resolver/atlas do AppState por um instante: assim o
-            // closure abaixo não precisa capturar NADA de `self` — elimina de
-            // vez qualquer disputa de borrow com `doc` ou `chunk_cache`.
+            // Extrai sprite_resolver/atlas do AppState por um instante: assim os
+            // closures abaixo não capturam NADA de `self` — elimina qualquer
+            // disputa de borrow com `doc` ou `chunk_cache`.
             let mut sprite_resolver = self.state.sprite_resolver.take();
             let mut atlas_for_resolve = self.state.atlas.take();
             {
                 let doc = &mut self.state.documents[doc_index];
-                let resolver = |type_id: u16| -> u32 {
-                    let (Some(resolver), Some(atlas)) = (sprite_resolver.as_mut(), atlas_for_resolve.as_mut()) else {
-                        return 0;
+                let mut z = start_z;
+                loop {
+                    let resolver = |type_id: u16| -> u32 {
+                        let (Some(resolver), Some(atlas)) = (sprite_resolver.as_mut(), atlas_for_resolve.as_mut()) else {
+                            return 0;
+                        };
+                        resolver.layer_for(device, queue, atlas, type_id)
                     };
-                    resolver.layer_for(device, queue, atlas, type_id)
-                };
-                self.state.chunk_cache.sync_for_floor(device, &mut doc.map, floor, resolver);
+                    self.state.chunk_cache.sync_for_floor(device, &mut doc.map, z, resolver);
+                    if z == superend_z { break; }
+                    z -= 1;
+                }
             }
             self.state.sprite_resolver = sprite_resolver;
             self.state.atlas = atlas_for_resolve;
@@ -308,17 +371,37 @@ impl<'a> EditorTabViewer<'a> {
                 }
             }
 
+            // Pilha de andares a compor: distância do andar atual define alfa
+            // e deslocamento diagonal; o andar atual (distância 0) é desenhado
+            // por último, opaco, por cima do contexto semitransparente.
+            let mut layers: Vec<editor_render::scene::FloorLayer> = Vec::new();
+            {
+                let mut z = start_z;
+                loop {
+                    let distance = (end_z as i32 - z as i32).unsigned_abs() as f32;
+                    layers.push(editor_render::scene::FloorLayer {
+                        z,
+                        alpha: if z == end_z { 1.0 } else { 0.35 },
+                        pixel_offset: [distance * 32.0, distance * 32.0],
+                    });
+                    if z == superend_z { break; }
+                    z -= 1;
+                }
+            }
+            layers.sort_by_key(|l| if l.z == end_z { 1 } else { 0 });
+
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
                 zoom: self.state.camera_zoom,
                 _pad: 0.0,
                 viewport_size: [width as f32, height as f32],
-                _pad2: [0.0, 0.0],
+                floor_alpha: 1.0,
+                _pad2: 0.0,
             };
             if let (Some(resources), Some(atlas)) = (&self.state.tile_resources, &self.state.atlas) {
                 editor_render::scene::render_frame(
                     device, queue, resources, &self.state.chunk_cache, atlas,
-                    self.state.offscreen.as_ref().unwrap(), camera,
+                    self.state.offscreen.as_ref().unwrap(), camera, &layers,
                 );
             }
 
@@ -357,11 +440,12 @@ impl<'a> EditorTabViewer<'a> {
             let h = &self.state.hover_info;
             ui.label(format!("Position: [{}, {}, {}]", h.x, h.y, h.z));
             ui.separator();
+            ui.label(format!("Floor: {}", self.state.current_floor_display));
+            ui.separator();
             ui.label(format!("Zoom: {}%", (self.state.camera_zoom * 100.0) as i32));
         });
     }
 
-    /// Antigo "Palette" — agora é só o conteúdo da aba Objects.
     fn ui_objects(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Filter: City / Biome").weak());
         egui::ComboBox::from_id_salt("city_filter")
@@ -381,7 +465,6 @@ impl<'a> EditorTabViewer<'a> {
 
         ui.separator();
 
-        // ---- Selection: grupo independente ----
         ui.label(RichText::new("Selection").weak());
         radio_button(ui, &mut self.state.selection_brush, SelectionBrush::SingleSelect, "Single Select");
         ui.horizontal(|ui| {
@@ -389,7 +472,6 @@ impl<'a> EditorTabViewer<'a> {
             radio_button(ui, &mut self.state.selection_brush, SelectionBrush::Border, "Border");
         });
 
-        // ---- Zones: grupo independente (não mexe em Selection nem Doors) ----
         ui.label(RichText::new("Zones").weak());
         ui.horizontal(|ui| {
             radio_button(ui, &mut self.state.zone_brush, ZoneBrush::ProtectionZone, "PZ");
@@ -398,7 +480,6 @@ impl<'a> EditorTabViewer<'a> {
             radio_button(ui, &mut self.state.zone_brush, ZoneBrush::NoLogout, "BlockLogout");
         });
 
-        // ---- Doors: grupo independente ----
         ui.label(RichText::new("Doors").weak());
         ui.horizontal(|ui| {
             radio_button(ui, &mut self.state.door_brush, DoorBrush::Normal, "Normal");
@@ -407,14 +488,12 @@ impl<'a> EditorTabViewer<'a> {
             radio_button(ui, &mut self.state.door_brush, DoorBrush::Magic, "Magic");
         });
 
-        // ---- Windows: grupo independente (faltava no protótipo anterior) ----
         ui.label(RichText::new("Windows").weak());
         ui.horizontal(|ui| {
             radio_button(ui, &mut self.state.window_brush, WindowBrush::Normal, "Normal");
             radio_button(ui, &mut self.state.window_brush, WindowBrush::Hatched, "Hatched");
         });
 
-        // ---- Estes já eram independentes de verdade, só corrigindo o binding ----
         ui.label(RichText::new("Auto-bordering").weak());
         ui.checkbox(&mut self.state.auto_border_active, "Active");
 
@@ -424,7 +503,6 @@ impl<'a> EditorTabViewer<'a> {
         ui.label(RichText::new("Brush Size").weak());
         ui.add(egui::Slider::new(&mut self.state.brush_size, 0..=10));
 
-        // ---- Brush Type: agora é de fato um select (Circle xor Square) ----
         ui.label(RichText::new("Brush Type").weak());
         ui.horizontal(|ui| {
             radio_button_req(ui, &mut self.state.brush_shape, BrushShape::Circle, "Circle");
@@ -436,7 +514,6 @@ impl<'a> EditorTabViewer<'a> {
         ui.label(RichText::new(format!("{name} — em construção")).weak());
     }
 
-    /// Nova aba World.
     fn ui_world(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("World Light").weak());
         ui.add(egui::Slider::new(&mut self.state.world_light, 0..=100));
@@ -458,7 +535,6 @@ impl<'a> EditorTabViewer<'a> {
             });
     }
 
-    /// Inspector agora só tem Tile/Item properties (World Light saiu daqui).
     fn ui_inspector(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Tile properties").strong());
         ui.separator();

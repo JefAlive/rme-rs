@@ -1,10 +1,10 @@
-// crates/editor_render/src/shader.wgsl — substituir por completo
 struct Camera {
     offset: vec2<f32>,
     zoom: f32,
     _pad: f32,
     viewport_size: vec2<f32>,
-    _pad2: vec2<f32>,
+    floor_alpha: f32,
+    _pad2: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -44,5 +44,6 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(atlas_tex, atlas_sampler, in.uv, i32(in.layer)) * in.tint;
+    let sampled = textureSample(atlas_tex, atlas_sampler, in.uv, i32(in.layer)) * in.tint;
+    return vec4<f32>(sampled.rgb, sampled.a * camera.floor_alpha);
 }

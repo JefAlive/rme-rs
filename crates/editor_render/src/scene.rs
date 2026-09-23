@@ -10,9 +10,6 @@ pub struct ChunkGpuCache {
 
 impl ChunkGpuCache {
     /// Só retesselado os chunks marcados dirty — o resto do mapa não custa nada.
-    /// A resolução `type_id -> layer do atlas` fica a cargo do chamador (Fase 4);
-    /// aqui o chão vira um quad 32x32 na camada resolvida.
-    ///
     /// Apenas os chunks do andar `floor` são sincronizados.
     pub fn sync_for_floor(
         &mut self,
@@ -55,17 +52,31 @@ impl ChunkGpuCache {
         }
     }
 
-    fn draw_all<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        for (buf, count) in self.buffers.values() {
-            if *count == 0 { continue; }
+    /// Desenha só os chunks do andar `z` — usado para compor a pilha
+    /// multi-andar, um draw call por `FloorLayer`.
+    fn draw_floor<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, z: u8) {
+        for (coord, (buf, count)) in self.buffers.iter() {
+            if coord.z != z || *count == 0 {
+                continue;
+            }
             pass.set_vertex_buffer(1, buf.slice(..));
             pass.draw(0..4, 0..*count);
         }
     }
 }
 
-/// Isto é o "render-to-texture" propriamente dito: encoder próprio,
-/// render pass mirando a OffscreenTarget, submit próprio.
+/// Um andar a compor no frame: `alpha` controla a transparência (1.0 = andar
+/// atual, opaco) e `pixel_offset` aplica o deslocamento diagonal — quanto
+/// mais distante do andar atual, maior o deslocamento, dando profundidade.
+#[derive(Copy, Clone)]
+pub struct FloorLayer {
+    pub z: u8,
+    pub alpha: f32,
+    pub pixel_offset: [f32; 2],
+}
+
+/// Render-to-texture: um encoder próprio, um draw call por `FloorLayer`,
+/// cada um lendo sua própria fatia do uniform buffer via dynamic offset.
 pub fn render_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -73,24 +84,39 @@ pub fn render_frame(
     cache: &ChunkGpuCache,
     atlas: &crate::atlas::SpriteAtlas,
     target: &OffscreenTarget,
-    camera: CameraUniform,
+    base_camera: CameraUniform,
+    layers: &[FloorLayer],
 ) {
-    queue.write_buffer(&resources.camera_buf, 0, bytemuck::cast_slice(&[camera]));
+    let stride = resources.camera_stride as u64;
+    for (i, layer) in layers.iter().enumerate().take(crate::pipeline::MAX_FLOOR_LAYERS) {
+        let mut cam = base_camera;
+        cam.offset[0] += layer.pixel_offset[0];
+        cam.offset[1] += layer.pixel_offset[1];
+        cam.floor_alpha = layer.alpha;
+        queue.write_buffer(&resources.camera_buf, i as u64 * stride, bytemuck::cast_slice(&[cam]));
+    }
+
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewport_encoder") });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("viewport_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.view, resolve_target: None,
+                view: &target.view,
+                resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.05, b: 0.03, a: 1.0 }), store: wgpu::StoreOp::Store },
             })],
-            depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
         });
         pass.set_pipeline(&resources.pipeline);
-        pass.set_bind_group(0, &resources.camera_bind_group, &[]);
         pass.set_bind_group(1, &atlas.bind_group, &[]);
         pass.set_vertex_buffer(0, resources.quad_vbuf.slice(..));
-        cache.draw_all(&mut pass);
+
+        for (i, layer) in layers.iter().enumerate().take(crate::pipeline::MAX_FLOOR_LAYERS) {
+            pass.set_bind_group(0, &resources.camera_bind_group, &[(i as u64 * stride) as u32]);
+            cache.draw_floor(&mut pass, layer.z);
+        }
     }
     queue.submit(Some(encoder.finish()));
 }
