@@ -269,7 +269,7 @@ impl<'a> EditorTabViewer<'a> {
                 let mut tx = doc.begin_transaction("Paint");
                 tx.record_before(doc, world_pos);
                 let mut tile = doc.map.get_tile(world_pos).cloned().unwrap_or_default();
-                let sprite_id = self.state.atlas.as_ref().map(|a| 1 + (42 % a.layer_count)).unwrap_or(1);
+                let sprite_id = self.state.atlas.as_ref().map(|a| 1 + (42 % a.layer_count())).unwrap_or(1);
                 tile.ground = Some(editor_core::item::Item::new(sprite_id as u16));
                 tx.set_after(world_pos, tile);
                 tx.commit(doc);
@@ -396,9 +396,9 @@ impl<'a> EditorTabViewer<'a> {
         ui.separator();
         ui.label(RichText::new("Item properties").strong());
         ui.horizontal(|ui| {
-            if ui.button("Move Up").clicked() {}
-            if ui.button("Move Down").clicked() {}
-            if ui.add(egui::Button::new("Delete").fill(egui::Color32::from_rgb(0xff, 0x67, 0x67))).clicked() {}
+            ui.button("Move Up").clicked();
+            ui.button("Move Down").clicked();
+            ui.add(egui::Button::new("Delete").fill(egui::Color32::from_rgb(0xff, 0x67, 0x67))).clicked();
         });
         ui.label("Item ID"); ui.add(egui::DragValue::new(&mut 0));
         ui.label("Text"); ui.text_edit_multiline(&mut String::new());

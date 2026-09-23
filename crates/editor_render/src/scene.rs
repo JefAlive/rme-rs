@@ -24,14 +24,14 @@ impl ChunkGpuCache {
                     y: coord.cy as u16 * CHUNK_SIZE + ly,
                     z: coord.z,
                 };
-                if let Some(tile) = map.get_tile(pos) {
-                    if let Some(ground) = &tile.ground {
-                        instances.push(TileInstance {
-                            world_pos: [pos.x as f32, pos.y as f32],
-                            layer_index: resolve_layer(ground.type_id),
-                            tint: [1.0, 1.0, 1.0, 1.0],
-                        });
-                    }
+                if let Some(tile) = map.get_tile(pos)
+                    && let Some(ground) = &tile.ground
+                {
+                    instances.push(TileInstance {
+                        world_pos: [pos.x as f32, pos.y as f32],
+                        layer_index: resolve_layer(ground.type_id),
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                    });
                 }
             }
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {

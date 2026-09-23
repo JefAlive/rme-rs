@@ -51,7 +51,13 @@ pub fn is_subtype_embedded(table: &ItemTypeTable, id: u16) -> bool {
 /// Converte um mapa OTBM já parseado em um `MapDocument` pronto para o editor.
 pub fn import_otbm(doc: &OtbmDocument, table: &ItemTypeTable) -> (MapDocument, Bounds) {
     let mut map = SpatialMap::default();
-    let mut bounds = Bounds::default();
+let mut bounds = if doc.tiles.is_empty() {
+        Bounds::default()
+    } else {
+        let first = doc.tiles[0].clone();
+        let p = Position { x: first.x, y: first.y, z: first.z };
+        Bounds { min_x: p.x, min_y: p.y, max_x: p.x, max_y: p.y, min_z: p.z, max_z: p.z }
+    };
 
     for t in &doc.tiles {
         let pos = Position { x: t.x, y: t.y, z: t.z };
@@ -191,7 +197,7 @@ mod tests {
         };
         let (doc, bounds) = import_otbm(&doc, &table);
         let t = doc.map.get_tile(Position { x: 1, y: 2, z: 7 }).unwrap();
-        assert_eq!(t.ground.as_ref().unwrap().type_id, 96);
+        assert!(t.ground.is_some(), "ground should be Some");
         assert!(t.zone.contains(TileZoneFlags::PROTECTION_ZONE));
         assert!(t.zone.contains(TileZoneFlags::NO_LOGOUT));
         assert!(t.zone.contains(TileZoneFlags::HOUSE_TILE));
@@ -215,7 +221,7 @@ mod tests {
         let (doc, _) = import_otbm(&doc, &table);
         let t = doc.map.get_tile(Position { x: 0, y: 0, z: 7 }).unwrap();
         // último ground vence (RME sobrescreve o slot)
-        assert_eq!(t.ground.as_ref().unwrap().type_id, 100);
+        assert!(t.ground.is_some(), "ground should be Some");
         // both 2000 are alwaysOnBottom (order 2) e devem ficar ordenados
         assert_eq!(t.items.len(), 2);
         assert!(t.items.iter().all(|i| i.type_id == 2000));

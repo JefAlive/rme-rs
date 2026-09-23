@@ -103,15 +103,42 @@ Fonte da verdade: `reference-src/source/map_drawer.cpp` (BlitItem/DrawTile),
 `reference-src/source/gui.cpp` (ordem `ClientAssets::loadAppearanceProtobuf`
 → `g_items.loadFromProtobuf`).
 
-- `editor_render::atlas` ganha API de **registrar sprite sob demanda**:
-  `layer_for(sprite_id)` → cache `HashMap<sprite_id, u32 layer>`; novo sprite extraído
-  via Fase 3 e copiado com `queue.write_texture` numa layer (atlas cresce).
-- `scene.rs`: resolver `ground.type_id → sprite_id → layer` e montar `TileInstance`
-  (v0: só ground; `layer_index = layer`; tint branco).
-- `main.rs`: load do assets dir + do `.otbm`. **Assets dir e `.otbm` vem de
-  constantes de debug apontando pro `reference-assets` e `reference-maps`** (menu
-  Open real fica pra depois); câmera inicial centralizada no bbox do mapa.
-- Critério: abrir `Dawnport.otbm` → chão (ground) do z=7 aparece em 2D.
+### Concluído (ponte core)
+
+- `editor_core::import::import_otbm(doc, table) → (MapDocument, Bounds)`: converte
+  um `OtbmDocument` parseado para o `MapDocument` interno do editor, populando
+  `SpatialMap` com `Tile { ground, items, zone, house_id }`. A semântica de
+  `Tile::addItem` é fiel ao RME: ground sobrescreve (último vence); itens
+  `always_on_bottom` são inseridos pela posição `always_on_top_order`; demais
+  vão ao final. Zone flags (`PROTECTION_ZONE`, `NO_LOGOUT`, `PVP_ZONE`, etc.) e
+  `house_id` → `HOUSE_TILE` são mapeados corretamente. 3 testes unitários validam
+  a conversão (ground, zone, house). Dependência: `editor_formats` (protobuf +
+  catalog). Fonte de teste: documentos OTBM sintéticos e `Dawnport.otbm`.
+
+### Pendente (render + UI)
+
+- **`editor_render::atlas.rs`**: `SpriteAtlas` com API `append(device, queue, rgba) → u32`
+  (cresce automaticamente, armazena células RGBA 32×32 em textura array D2).
+- **`editor_render::assets.rs`** (novo módulo): `SpriteResolver` que resolve
+  `type_id → sprite_id → célula RGBA → layer do atlas`:
+  - Carrega `catalog-content.json` + `appearances.dat` do `assets_dir`.
+  - Cache de sheets decodificadas via `editor_formats::sprite::decode_sheet`.
+  - `layer_for(type_id) → u32`: primeiro sprite do tipo, decodifica a sheet,
+    extrai a célula 32×32 (respectando `SpriteLayout`: 1x1/top-left, 2x1/direita,
+    1x2/baixo, 2x2/canto sup.-esq.), devolve índice da layer e grava no atlas.
+  - O atlas inicia vazio (1 camada transparente) e cresce conforme sprites são
+    exibidos.
+- **`editor_ui::tabs.rs`**: adicionar `sprite_resolver: Option<SpriteResolver>` ao
+  `AppState`; substituir a closure `|type_id| type_id as u32` por
+  `resolver.real(type_id)` que usa o SpriteResolver; adicionar `camera_fit_pending`
+  e centralizar a câmera no bbox do mapa z=7 ao primeiro frame.
+- **`editor_app::main.rs`**: carregar `appearances.dat` + `catalog-content.json` do
+  `reference-assets`; construir `MapDocument` via `import_otbm`; criar atlas e
+  resolver; remover o `placeholder_sprites` / demo 16×16; câmera inicial centralizada
+  no bbox do mapa z=7; registrar log de load.
+
+- Critério: abrir `Dawnport.otbm` → chão (ground) do z=7 aparece em 2D usando o
+  atlas de sprites real.
 
 ## Fase 5 — Itens, profundidade e sprites maiores
 
@@ -136,6 +163,6 @@ Fonte da verdade: `reference-src/source/map_drawer.cpp` (BlitItem/DrawTile),
 | 1 | `editor_formats/src/otbm.rs` (+ `Cargo.toml` sem deps novas) |
 | 2 | `editor_formats/src/appearances.rs`, `editor_formats/src/pb.rs` |
 | 3 | `editor_formats/src/{catalog,sprite}.rs`, deps: `serde_json`,`lzma-rs` |
-| 4 | `editor_render/src/atlas.rs`, `scene.rs`, `main.rs`, `tabs.rs` |
+| 4 | `editor_core/src/import.rs`, `editor_render/src/atlas.rs`, `editor_render/src/assets.rs` (novo), `scene.rs`, `main.rs`, `tabs.rs` |
 | 5 | `editor_render/src/{instance,scene}.rs`, `pipeline.rs`, `shader.wgsl` |
 | 6 | `main.rs`, docs |

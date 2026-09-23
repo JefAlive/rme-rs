@@ -50,14 +50,16 @@ impl RmeApp {
             eprintln!("adapter: {}", info.name);
         }
 
-        let mut state = AppState::default();
-        state.wgpu = cc.wgpu_render_state.clone();
+        let mut state = AppState {
+            wgpu: cc.wgpu_render_state.clone(),
+            ..Default::default()
+        };
 
         let mut atlas_opt = None;
         if let Some(rs) = &state.wgpu {
-            let sprites = placeholder_sprites();
-            eprintln!("atlas placeholder: {} camadas", sprites.len());
-            atlas_opt = Some(SpriteAtlas::new(&rs.device, &rs.queue, &sprites));
+            let _sprites = placeholder_sprites();
+            eprintln!("atlas placeholder: {} camadas (não usado — atlas cresce sob demanda)", _sprites.len());
+            atlas_opt = Some(SpriteAtlas::new(&rs.device));
         }
         state.atlas = atlas_opt;
 
