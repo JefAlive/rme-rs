@@ -55,6 +55,7 @@ impl ChunkGpuCache {
                     elevation += visual.elevation;
                 }
 
+                // TESTE TEMPORÁRIO (itens REATIVADOS para teste de regressão).
                 for item in &tile.items {
                     let visual = resolve_visual(item.type_id);
                     instances.push(TileInstance {

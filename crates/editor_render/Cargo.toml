@@ -11,3 +11,7 @@ egui       = { workspace = true }
 egui-wgpu  = { workspace = true }
 ahash      = { workspace = true }
 editor_formats = { version = "0.1.0", path = "../editor_formats" }
+
+[dev-dependencies]
+pollster = "0.4"
+png = "0.17"

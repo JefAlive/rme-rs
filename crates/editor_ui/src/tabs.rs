@@ -282,8 +282,9 @@ impl<'a> EditorTabViewer<'a> {
                 }
             }
 
-            let floor = self.state.current_floor_display;
-            let (start_z, end_z, superend_z) = compute_floor_stack(floor);
+            // TESTE TEMPORÁRIO: fixar no andar 7, só o chão (ground), sem itens.
+            let floor = 7;
+            let (start_z, end_z, superend_z) = (7, 7, 7);
 
             let mut sprite_resolver = self.state.sprite_resolver.take();
             let mut atlas_for_resolve = self.state.atlas.take();

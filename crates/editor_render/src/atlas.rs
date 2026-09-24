@@ -1,49 +1,60 @@
 use ahash::AHashMap;
 
-pub const ATLAS_SIZE: u32 = 4096;
 pub const SPRITE_SIZE: u32 = 32;
-pub const ATLAS_COLS: u32 = ATLAS_SIZE / SPRITE_SIZE; // 128
-pub const ATLAS_SLOTS: u32 = ATLAS_COLS * ATLAS_COLS; // 16384
 
-/// Dynamic 2D sprite atlas.
+/// Limite desejado de layers. O limite real é o `max_texture_array_layers`
+/// do adapter (Vulkan/MTL/DX12 geralmente 2048; GL mínimo 256), então
+/// clampamos com `min`.
+const DESIRED_LAYERS: u32 = 2048;
+
+/// "Atlas" degradado — TESTE TEMPORÁRIO, sem otimização.
 ///
-/// Textura 2D (4096×4096) alocada na GPU dividida em slots 32×32.
-/// Mantém um cache em memória `sprite_id -> slot`. Se encher, sobrescreve o mais antigo (FIFO).
+/// Array de texturas na GPU com UMA layer 32×32 por sprite: o índice do
+/// sprite É a própria layer (sem packing, sem evicção FIFO, sem coordenada
+/// de slot). O shader resolve a layer e amostra direto com `texture_2d_array`.
+///
+/// A única "inteligência" mantida é a deduplicação sprite_id → layer
+/// (guardada em `sprite_to_layer`), que é corretude, não otimização: sem ela
+/// cada tile reescreveria milhões de cópias do mesmo sprite.
 pub struct SpriteAtlas {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_layout: wgpu::BindGroupLayout,
     texture: wgpu::Texture,
-    sprite_to_slot: AHashMap<u32, u32>,
-    slot_to_sprite: Vec<u32>,
-    next_slot: u32,
-    total_slots: u32,
-    cols: u32,
+    // Mantidos vivos deliberadamente: o bind group referencia essas views.
+    #[allow(dead_code)]
+    view: wgpu::TextureView,
+    #[allow(dead_code)]
+    sampler: wgpu::Sampler,
+    capacity: u32,
+    next_layer: u32,
+    sprite_to_layer: AHashMap<u32, u32>,
 }
 
 impl SpriteAtlas {
-    /// Cria o dynamic atlas 2D na GPU (slot 0 reservado como transparente).
-    pub fn new(device: &wgpu::Device) -> Self {
-        let total_slots = ATLAS_SLOTS;
-        let cols = ATLAS_COLS;
+    /// Cria o array de texturas na GPU (layer 0 reservada transparente).
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let capacity = device.limits().max_texture_array_layers.min(DESIRED_LAYERS);
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sprite_atlas_2d"),
+            label: Some("sprite_array"),
             size: wgpu::Extent3d {
-                width: ATLAS_SIZE,
-                height: ATLAS_SIZE,
-                depth_or_array_layers: 1,
+                width: SPRITE_SIZE,
+                height: SPRITE_SIZE,
+                depth_or_array_layers: capacity,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("sprite_atlas_view"),
-            dimension: Some(wgpu::TextureViewDimension::D2),
+            label: Some("sprite_array_view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(capacity),
             ..Default::default()
         });
 
@@ -62,7 +73,7 @@ impl SpriteAtlas {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
                     count: None,
@@ -91,69 +102,61 @@ impl SpriteAtlas {
             ],
         });
 
-        let slot_to_sprite = vec![0u32; total_slots as usize];
-        let sprite_to_slot = AHashMap::new();
-
-        Self {
+        let table = Self {
             bind_group,
             bind_group_layout,
             texture,
-            sprite_to_slot,
-            slot_to_sprite,
-            next_slot: 1, // slot 0 reservado transparente/vazio
-            total_slots,
-            cols,
-        }
+            view,
+            sampler,
+            capacity,
+            next_layer: 1, // layer 0 reservada transparente/vazia
+            sprite_to_layer: AHashMap::new(),
+        };
+        // Zero a layer 0 (transparente) — sentinela para sprite desconhecido.
+        let zeros = [0u8; (SPRITE_SIZE * SPRITE_SIZE * 4) as usize];
+        table.write_layer(queue, 0, &zeros);
+        table
     }
 
-    /// Retorna a posição do sprite no atlas se já estiver em cache.
+    /// Retorna a layer do sprite no array de texturas.
     pub fn get_slot(&self, sprite_id: u32) -> Option<u32> {
         if sprite_id == 0 {
             return Some(0);
         }
-        self.sprite_to_slot.get(&sprite_id).copied()
+        self.sprite_to_layer.get(&sprite_id).copied()
     }
 
-    /// Aloca um slot para o sprite e grava seus pixels na textura GPU via `queue.write_texture`.
-    /// Se o atlas encher, o slot mais antigo é sobrescrito (ring buffer / FIFO).
+    /// Adiciona o sprite como uma nova layer (ou reusa a já existente), e
+    /// grava seus pixels na GPU via `queue.write_texture`.
     pub fn insert(&mut self, queue: &wgpu::Queue, sprite_id: u32, rgba: &[u8; 32 * 32 * 4]) -> u32 {
         if sprite_id == 0 {
             return 0;
         }
-        if let Some(&slot) = self.sprite_to_slot.get(&sprite_id) {
-            return slot;
+        if let Some(&layer) = self.sprite_to_layer.get(&sprite_id) {
+            return layer;
         }
 
-        let slot = self.next_slot;
-        self.next_slot += 1;
-        if self.next_slot >= self.total_slots {
-            self.next_slot = 1; // substitui os mais antigos
-        }
-
-        // Se o slot já possuía outro sprite, remove do mapa — e AVISA, porque
-        // isso significa que algum item já desenhado com esse slot vai passar
-        // a mostrar o sprite NOVO silenciosamente (mesma classe de bug do
-        // clamp de anim_id, só que pelo lado do atlas).
-        let old_sprite = self.slot_to_sprite[slot as usize];
-        if old_sprite != 0 && old_sprite != sprite_id {
-            self.sprite_to_slot.remove(&old_sprite);
+        let layer = self.next_layer;
+        if layer >= self.capacity {
             eprintln!(
-                "[atlas] AVISO: slot {slot} reciclado — sprite {old_sprite} substituído por {sprite_id}. \
-                 Atlas cheio ({} slots); se isto aparecer com frequência, ATLAS_SIZE precisa crescer.",
-                self.total_slots
+                "[atlas/TESTE] capacidade de layers excedida ({layer} >= {}) sprite={sprite_id} — \
+                 desenhando transparente. Aumente DESIRED_LAYERS em atlas.rs.",
+                self.capacity
             );
+            return 0;
         }
-        self.slot_to_sprite[slot as usize] = sprite_id;
-        self.sprite_to_slot.insert(sprite_id, slot);
+        self.next_layer += 1;
+        self.sprite_to_layer.insert(sprite_id, layer);
+        self.write_layer(queue, layer, rgba);
+        layer
+    }
 
-        let col = slot % self.cols;
-        let row = slot / self.cols;
-
+    fn write_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
         queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: col * SPRITE_SIZE, y: row * SPRITE_SIZE, z: 0 },
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
@@ -164,17 +167,25 @@ impl SpriteAtlas {
             },
             wgpu::Extent3d { width: SPRITE_SIZE, height: SPRITE_SIZE, depth_or_array_layers: 1 },
         );
-
-        slot
     }
 
-    /// Retorna a quantidade de sprites atualmente mantidos em cache.
+    /// Número de sprites atualmente em cache (exclui a layer transparente).
     pub fn layer_count(&self) -> u32 {
-        self.sprite_to_slot.len().max(1) as u32
+        (self.next_layer - 1).max(1)
     }
 
-    /// Total de slots disponíveis no atlas 2D.
+    /// TESTE TEMPORÁRIO (debug): acesso direto à textura p/ readback headless.
+    pub fn debug_texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    /// TESTE TEMPORÁRIO (debug): layer indices inseridos, p/ conferência CPU.
+    pub fn debug_sprite_layer(&self) -> &AHashMap<u32, u32> {
+        &self.sprite_to_layer
+    }
+
+    /// Total de layers disponíveis no array de texturas.
     pub fn max_layers(&self) -> u32 {
-        self.total_slots
+        self.capacity
     }
 }

@@ -43,13 +43,13 @@ impl AnimTable {
         let entries_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("anim_entries"),
             size: MAX_ANIM_ENTRIES as u64 * std::mem::size_of::<AnimEntry>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let frames_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("anim_frames"),
             size: MAX_ANIM_FRAMES as u64 * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -145,5 +145,45 @@ impl AnimTable {
         );
         self.entries_len += 1;
         id
+    }
+
+    /// TESTE TEMPORÁRIO (debug): conteúdo do entries/frames p/ conferência CPU.
+    pub fn debug_readback(&self, device: &wgpu::Device, queue: &wgpu::Queue, max_frames: u32) -> (Vec<AnimEntry>, Vec<u32>) {
+        let entries = self.entries_len;
+        let frames = self.frames_len.min(max_frames);
+        let mut ebuf = vec![0u8; (entries as usize) * std::mem::size_of::<AnimEntry>()];
+        let mut fbuf = vec![0u8; (frames as usize) * 4];
+        for (slot, data) in [(&self.entries_buf, &mut ebuf), (&self.frames_buf, &mut fbuf)] {
+            let size = data.len() as u64;
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("anim_debug"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            enc.copy_buffer_to_buffer(slot, 0, &staging, 0, size);
+            queue.submit([enc.finish()]);
+            let slice = staging.slice(..);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::Maintain::Wait);
+            data.copy_from_slice(&slice.get_mapped_range());
+        }
+        let mut entries_v = Vec::with_capacity(entries as usize);
+        for i in 0..entries as usize {
+            let off = i * std::mem::size_of::<AnimEntry>();
+            entries_v.push(AnimEntry {
+                first_frame: u32::from_le_bytes(ebuf[off..off + 4].try_into().unwrap()),
+                frame_count: u32::from_le_bytes(ebuf[off + 4..off + 8].try_into().unwrap()),
+                frame_duration_ms: u32::from_le_bytes(ebuf[off + 8..off + 12].try_into().unwrap()),
+                mode: u32::from_le_bytes(ebuf[off + 12..off + 16].try_into().unwrap()),
+            });
+        }
+        let mut frames_v = Vec::with_capacity(frames as usize);
+        for i in 0..frames as usize {
+            let off = i * 4;
+            frames_v.push(u32::from_le_bytes(fbuf[off..off + 4].try_into().unwrap()));
+        }
+        (entries_v, frames_v)
     }
 }
