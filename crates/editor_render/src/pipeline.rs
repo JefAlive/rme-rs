@@ -20,7 +20,7 @@ pub struct TileRenderResources {
 pub struct CameraUniform {
     pub offset: [f32; 2],
     pub zoom: f32,
-    pub _pad: f32,
+    pub atlas_columns: u32,
     pub viewport_size: [f32; 2],
     pub floor_alpha: f32,
     pub _pad2: f32,

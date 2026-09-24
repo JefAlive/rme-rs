@@ -157,6 +157,7 @@ pub fn render_frame(
         let mut cam = base_camera;
         cam.offset[0] += layer.pixel_offset[0];
         cam.offset[1] += layer.pixel_offset[1];
+        cam.atlas_columns = atlas.columns();
         cam.floor_alpha = layer.alpha;
         queue.write_buffer(&resources.camera_buf, i as u64 * stride, bytemuck::cast_slice(&[cam]));
     }

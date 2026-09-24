@@ -1,162 +1,112 @@
-/// Sprite atlas textura em array 2D com crescimento dinâmico.
+/// Atlas 2D de sprites 32×32, organizado em slots lineares.
 ///
-/// Cada camada contém um quadrado 32×32 de pixels RGBA.
-/// O atlas cresce automaticamente quando necessário (dobrando a capacidade).
+/// A largura usa o maior número potência de dois de sprites por linha que a
+/// GPU suporta. A altura cresce em linhas sob demanda, sem usar o limite bem
+/// menor de layers das texture arrays.
 pub struct SpriteAtlas {
     pub bind_group: wgpu::BindGroup,
     pub bind_group_layout: wgpu::BindGroupLayout,
     texture: wgpu::Texture,
     cells: Vec<[u8; 32 * 32 * 4]>,
-    capacity: u32,
-    max_layers: u32,
+    columns: u32,
+    rows: u32,
+    max_rows: u32,
 }
 
 impl SpriteAtlas {
-    /// Cria um atlas vazio com 1 camada (transparente).
     pub fn new(device: &wgpu::Device) -> Self {
-        let max_layers = device.limits().max_texture_array_layers.max(1);
-        let capacity = 1;
-        let cells = vec![[0u8; 32 * 32 * 4]]; // camada 0 transparente
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sprite_atlas"),
-            size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: capacity },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let max_dimension = (device.limits().max_texture_dimension_2d / 32).max(1);
+        let columns = 1 << (31 - max_dimension.leading_zeros());
+        let max_rows = max_dimension;
+        let rows = 1;
+        let texture = create_texture(device, columns, rows);
+        let bind_group_layout = create_bind_group_layout(device);
+        let bind_group = create_bind_group(device, &bind_group_layout, &texture);
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("atlas_sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("atlas_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("atlas_bg"), layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
-
-        Self { bind_group, bind_group_layout, texture, cells, capacity, max_layers }
+        Self {
+            bind_group,
+            bind_group_layout,
+            texture,
+            cells: vec![[0; 32 * 32 * 4]], // slot zero transparente
+            columns,
+            rows,
+            max_rows,
+        }
     }
 
-    /// Retorna o número atual de camadas (sprites) no atlas.
     pub fn layer_count(&self) -> u32 {
         self.cells.len() as u32
     }
 
-    /// Limite máximo de camadas (textura array) conforme o GPU.
+    /// Mantido para diagnóstico legado: agora representa slots totais
+    /// endereçáveis, não texture-array layers.
     pub fn max_layers(&self) -> u32 {
-        self.max_layers
+        self.columns.saturating_mul(self.max_rows)
     }
 
-    /// Anexa uma nova célula RGBA (32×32) ao atlas, retornando o índice da camada.
-    /// O atlas cresce até `max_layers`; após cheio, retorna 0 (transparente).
-    pub fn append(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, rgba: &[u8; 32 * 32 * 4]) -> u32 {
-        let layer = self.cells.len() as u32;
+    pub fn columns(&self) -> u32 {
+        self.columns
+    }
 
-        if layer >= self.max_layers {
-            return 0; // atlas cheio — devolve camada transparente
+    pub fn append(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba: &[u8; 32 * 32 * 4],
+    ) -> u32 {
+        let slot = self.cells.len() as u32;
+        if slot >= self.max_layers() {
+            return 0;
         }
 
-        if layer == self.capacity {
-            let new_cap = self.capacity.checked_mul(2).unwrap_or(self.max_layers)
-                .min(self.max_layers)
-                .max(1);
-            if new_cap <= self.capacity {
-                return 0;
-            }
-
-            let new_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("sprite_atlas"),
-                size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: new_cap },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            // Copiar células existentes para a nova textura
-            for (i, &cell) in self.cells.iter().enumerate() {
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        texture: &new_texture, mip_level: 0,
-                        origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &cell,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(32 * 4),
-                        rows_per_image: Some(32),
-                    },
-                    wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
-                );
-            }
-
-            let new_view = new_texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
-                ..Default::default()
-            });
-
-            let new_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("atlas_sampler"),
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                ..Default::default()
-            });
-
-            self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("atlas_bg"), layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&new_sampler) },
-                ],
-            });
-
-            self.texture = new_texture;
-            self.capacity = new_cap;
+        let needed_row = slot / self.columns;
+        if needed_row >= self.rows && !self.grow_to_fit(device, queue, needed_row + 1) {
+            return 0;
         }
 
         self.cells.push(*rgba);
+        self.write_cell(queue, slot, rgba);
+        slot
+    }
 
+    fn grow_to_fit(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed_rows: u32) -> bool {
+        let mut new_rows = self.rows;
+        while new_rows < needed_rows && new_rows < self.max_rows {
+            new_rows = new_rows.saturating_mul(2).min(self.max_rows);
+        }
+        if new_rows < needed_rows || new_rows == self.rows {
+            return false;
+        }
+
+        let new_texture = create_texture(device, self.columns, new_rows);
+        for (slot, cell) in self.cells.iter().enumerate() {
+            self.write_cell_to(queue, &new_texture, slot as u32, cell);
+        }
+
+        self.bind_group = create_bind_group(device, &self.bind_group_layout, &new_texture);
+        self.texture = new_texture;
+        self.rows = new_rows;
+        eprintln!(
+            "sprite atlas: cresceu para {}x{} slots ({} sprites/linha)",
+            self.columns * 32,
+            self.rows * 32,
+            self.columns,
+        );
+        true
+    }
+
+    fn write_cell(&self, queue: &wgpu::Queue, slot: u32, rgba: &[u8; 32 * 32 * 4]) {
+        self.write_cell_to(queue, &self.texture, slot, rgba);
+    }
+
+    fn write_cell_to(&self, queue: &wgpu::Queue, texture: &wgpu::Texture, slot: u32, rgba: &[u8]) {
+        let x = (slot % self.columns) * 32;
+        let y = (slot / self.columns) * 32;
         queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: &self.texture, mip_level: 0,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
@@ -167,7 +117,54 @@ impl SpriteAtlas {
             },
             wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
         );
-
-        layer
     }
+}
+
+fn create_texture(device: &wgpu::Device, columns: u32, rows: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sprite_atlas_2d"),
+        size: wgpu::Extent3d {
+            width: columns * 32,
+            height: rows * 32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+fn create_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sprite_atlas_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    })
+}
+
+fn create_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    texture: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sprite_atlas_bg"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    })
 }

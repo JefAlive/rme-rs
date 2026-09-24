@@ -393,7 +393,7 @@ impl<'a> EditorTabViewer<'a> {
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
                 zoom: self.state.camera_zoom,
-                _pad: 0.0,
+                atlas_columns: 1,
                 viewport_size: [width as f32, height as f32],
                 floor_alpha: 1.0,
                 _pad2: 0.0,

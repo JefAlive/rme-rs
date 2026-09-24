@@ -1,15 +1,14 @@
 struct Camera {
     offset: vec2<f32>,
     zoom: f32,
-    _pad: f32,
+    atlas_columns: u32,
     viewport_size: vec2<f32>,
     floor_alpha: f32,
     _pad2: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
-@group(1) @binding(0) var atlas_tex: texture_2d_array<f32>;
-@group(1) @binding(1) var atlas_sampler: sampler;
+@group(1) @binding(0) var atlas_tex: texture_2d<f32>;
 
 struct VsIn {
     @location(0) quad_pos: vec2<f32>,
@@ -45,6 +44,12 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let sampled = textureSample(atlas_tex, atlas_sampler, in.uv, i32(in.layer)) * in.tint;
+    let columns = max(camera.atlas_columns, 1u);
+    let slot_origin = vec2<i32>(
+        i32((in.layer % columns) * 32u),
+        i32((in.layer / columns) * 32u),
+    );
+    let local_pixel = clamp(vec2<i32>(in.uv * 32.0), vec2<i32>(0), vec2<i32>(31));
+    let sampled = textureLoad(atlas_tex, slot_origin + local_pixel, 0) * in.tint;
     return vec4<f32>(sampled.rgb, sampled.a * camera.floor_alpha);
 }
