@@ -5,18 +5,12 @@ use crate::{instance::TileInstance, offscreen::OffscreenTarget, pipeline::{Camer
 
 #[derive(Default)]
 pub struct ChunkGpuCache {
-    buffers: AHashMap<ChunkCoord, ChunkBuffers>,
-}
-
-#[derive(Default)]
-struct ChunkBuffers {
-    ground: Option<(wgpu::Buffer, u32)>,
-    item_layers: Vec<Option<(wgpu::Buffer, u32)>>,
+    floors: AHashMap<u8, Option<(wgpu::Buffer, u32)>>,
 }
 
 impl ChunkGpuCache {
-    /// Só retesselado os chunks marcados dirty — o resto do mapa não custa nada.
-    /// Apenas os chunks do andar `floor` são sincronizados.
+    /// Recria o buffer do andar se algum chunk mudou. O buffer é global por
+    /// andar para preservar a ordem isométrica tile-a-tile do RME.
     pub fn sync_for_floor(
         &mut self,
         device: &wgpu::Device,
@@ -28,11 +22,10 @@ impl ChunkGpuCache {
             .filter(|(c, _)| c.z == floor)
             .map(|(c, _)| *c)
             .collect();
-        let mut ground_count = 0usize;
-        let mut stacked_count = 0usize;
-        for coord in dirty {
-            let mut grounds = Vec::with_capacity(1024);
-            let mut item_layers: Vec<Vec<TileInstance>> = Vec::new();
+        if dirty.is_empty() { return; }
+
+        let mut positions = Vec::new();
+        for (coord, chunk) in map.iter_chunk_coords().filter(|(coord, _)| coord.z == floor) {
             for local_idx in 0..(CHUNK_SIZE as usize * CHUNK_SIZE as usize) {
                 let lx = (local_idx % CHUNK_SIZE as usize) as u16;
                 let ly = (local_idx / CHUNK_SIZE as usize) as u16;
@@ -41,67 +34,43 @@ impl ChunkGpuCache {
                     y: coord.cy as u16 * CHUNK_SIZE + ly,
                     z: coord.z,
                 };
-                if let Some(tile) = map.get_tile(pos) {
-                    let mut elevation = 0.0;
-                    if let Some(ground) = &tile.ground {
-                        let visual = resolve_visual(ground.type_id, pos);
-                        append_visual_instances(&mut grounds, pos, visual, elevation);
-                        elevation += visual.elevation;
-                    }
-
-                    // Cada índice da pilha vira uma passada separada. Assim,
-                    // todos os grounds do andar são desenhados antes do
-                    // primeiro item, mesmo quando sprites avançam sobre SQMs
-                    // vizinhos. A ordem de tile.items preserva bottom → top.
-                    for (stack_index, item) in tile.items.iter().enumerate() {
-                        let visual = resolve_visual(item.type_id, pos);
-                        if item_layers.len() <= stack_index {
-                            item_layers.resize_with(stack_index + 1, Vec::new);
-                        }
-                        append_visual_instances(&mut item_layers[stack_index], pos, visual, elevation);
-                        elevation += visual.elevation;
-                    }
+                if !chunk.tile(local_idx).is_empty() {
+                    positions.push(pos);
                 }
             }
-            let buffers = ChunkBuffers {
-                ground: upload_instances(device, "chunk_ground", &grounds),
-                item_layers: item_layers.iter().map(|items| upload_instances(device, "chunk_item_layer", items)).collect(),
-            };
-            ground_count += grounds.len();
-            stacked_count += item_layers.iter().map(Vec::len).sum::<usize>();
-            self.buffers.insert(coord, buffers);
-            map.clear_dirty(&coord);
         }
-        if ground_count + stacked_count > 0 {
-            eprintln!("render cache z={floor}: grounds={ground_count}, stacked_items={stacked_count}");
+
+        // RME visita folhas 4×4 em x/y e tiles dentro de cada folha também
+        // em x/y. Cada tile desenha ground e sua pilha antes do próximo tile.
+        positions.sort_unstable_by_key(|p| (p.x / 4, p.y / 4, p.x % 4, p.y % 4));
+
+        let mut instances = Vec::with_capacity(positions.len() * 2);
+        for pos in positions {
+            let Some(tile) = map.get_tile(pos) else { continue };
+            let mut elevation = 0.0;
+            if let Some(ground) = &tile.ground {
+                let visual = resolve_visual(ground.type_id, pos);
+                append_visual_instances(&mut instances, pos, visual, elevation);
+                elevation += visual.elevation;
+            }
+            for item in &tile.items {
+                let visual = resolve_visual(item.type_id, pos);
+                append_visual_instances(&mut instances, pos, visual, elevation);
+                elevation += visual.elevation;
+            }
+        }
+
+        self.floors.insert(floor, upload_instances(device, "floor_instances", &instances));
+        for coord in dirty {
+            map.clear_dirty(&coord);
         }
     }
 
-    /// Desenha só os chunks do andar `z` — usado para compor a pilha
-    /// multi-andar. Primeiro todos os grounds; depois a pilha item por item.
+    /// Desenha o buffer ordenado tile-a-tile do andar `z`.
     fn draw_floor<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, z: u8) {
-        for (coord, buffers) in self.buffers.iter() {
-            if coord.z == z {
-                if let Some((buf, count)) = &buffers.ground {
-                    pass.set_vertex_buffer(1, buf.slice(..));
-                    pass.draw(0..4, 0..*count);
-                }
-            }
-        }
-
-        let layer_count = self.buffers.iter()
-            .filter(|(coord, _)| coord.z == z)
-            .map(|(_, buffers)| buffers.item_layers.len())
-            .max()
-            .unwrap_or(0);
-        for layer in 0..layer_count {
-            for (coord, buffers) in self.buffers.iter() {
-                if coord.z != z { continue; }
-                if let Some(Some((buf, count))) = buffers.item_layers.get(layer) {
-                    pass.set_vertex_buffer(1, buf.slice(..));
-                    pass.draw(0..4, 0..*count);
-                }
-            }
+        if let Some(Some((buf, count))) = self.floors.get(&z) {
+            pass.set_vertex_buffer(1, buf.slice(..));
+            pass.draw(0..4, 0..*count);
         }
     }
 }
@@ -120,7 +89,12 @@ fn append_visual_instances(
             let y_offset = part_y as i32 - (height as i32 - 1);
             instances.push(TileInstance {
                 world_pos: [pos.x as f32 + x_offset as f32, pos.y as f32 + y_offset as f32],
-                pixel_offset: [visual.draw_offset[0], visual.draw_offset[1] - elevation],
+                // BlitItem do RME desloca a pilha em ambos os eixos da tela:
+                // draw_x -= drawHeight; draw_y -= drawHeight.
+                pixel_offset: [
+                    -visual.draw_offset[0] - elevation,
+                    -visual.draw_offset[1] - elevation,
+                ],
                 layer_index: visual.layer_index + part_y * width + part_x,
                 tint: [1.0, 1.0, 1.0, 1.0],
             });
