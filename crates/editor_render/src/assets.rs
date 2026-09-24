@@ -16,7 +16,9 @@ struct DecodedSheet {
 
 /// Célula decodificada de um sprite junto com metadados para logs.
 struct DecodedSpriteCell {
-    rgba: [u8; 32 * 32 * 4],
+    cells: Vec<[u8; 32 * 32 * 4]>,
+    width: u8,
+    height: u8,
     sheet_file: String,
     layout: editor_formats::catalog::SpriteLayout,
     cell_x: usize,
@@ -30,8 +32,8 @@ pub struct SpriteResolver {
     assets_dir: PathBuf,
     /// Cache de sheets decodificadas por `first_id` do SpriteSheetInfo.
     sheet_cache: AHashMap<u32, Arc<DecodedSheet>>,
-    /// Cache `sprite_id → layer_index` no atlas.
-    sprite_layer: AHashMap<u32, u32>,
+    /// Cache `sprite_id → blocos 32×32 contíguos` no atlas.
+    sprite_layer: AHashMap<u32, CachedSprite>,
     resolved: u64,
     cache_hits: u64,
     decode_failures: u64,
@@ -43,8 +45,17 @@ pub struct SpriteResolver {
 #[derive(Copy, Clone, Default)]
 pub struct ItemVisual {
     pub layer_index: u32,
+    pub width: u8,
+    pub height: u8,
     pub draw_offset: [f32; 2],
     pub elevation: f32,
+}
+
+#[derive(Copy, Clone)]
+struct CachedSprite {
+    base_layer: u32,
+    width: u8,
+    height: u8,
 }
 
 impl SpriteResolver {
@@ -104,6 +115,8 @@ impl SpriteResolver {
         let (offset_x, offset_y) = item_type.draw_offset();
         let visual = ItemVisual {
             layer_index: 0,
+            width: 1,
+            height: 1,
             draw_offset: [offset_x as f32, offset_y as f32],
             elevation: if item_type.has_elevation { item_type.draw_height() as f32 } else { 0.0 },
         };
@@ -137,9 +150,14 @@ impl SpriteResolver {
         }
 
         // Cache hit?
-        if let Some(&layer) = self.sprite_layer.get(&sprite_id) {
+        if let Some(&sprite) = self.sprite_layer.get(&sprite_id) {
             self.cache_hits += 1;
-            return ItemVisual { layer_index: layer, ..visual };
+            return ItemVisual {
+                layer_index: sprite.base_layer,
+                width: sprite.width,
+                height: sprite.height,
+                ..visual
+            };
         }
 
         // Decodificar sheet → célula RGBA 32×32
@@ -151,21 +169,31 @@ impl SpriteResolver {
             return visual;
         };
 
-        // Upload no atlas
-        let layer = atlas.append(device, queue, &cell.rgba);
-        if layer == 0 {
-            self.atlas_full += 1;
-            eprintln!("sprite resolver: atlas cheio (max_layers={}) sprite_id={sprite_id}", atlas.max_layers());
-            return visual;
+        // Os blocos 32×32 são adicionados em ordem de linha para que o shader
+        // calcule o slot de cada parte a partir do índice-base.
+        let mut base_layer = 0;
+        for (index, rgba) in cell.cells.iter().enumerate() {
+            let layer = atlas.append(device, queue, rgba);
+            if layer == 0 {
+                self.atlas_full += 1;
+                eprintln!("sprite resolver: atlas cheio (max_slots={}) sprite_id={sprite_id}", atlas.max_layers());
+                return visual;
+            }
+            if index == 0 { base_layer = layer; }
         }
 
-        self.sprite_layer.insert(sprite_id, layer);
+        let cached = CachedSprite {
+            base_layer,
+            width: cell.width,
+            height: cell.height,
+        };
+        self.sprite_layer.insert(sprite_id, cached);
         self.resolved += 1;
         eprintln!(
-            "sprite resolver: type_id={type_id} sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) layer={layer}",
-            cell.sheet_file, cell.layout, cell.cell_x, cell.cell_y,
+            "sprite resolver: type_id={type_id} sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) size={}x{} base_layer={base_layer}",
+            cell.sheet_file, cell.layout, cell.cell_x, cell.cell_y, cell.width, cell.height,
         );
-        ItemVisual { layer_index: layer, ..visual }
+        ItemVisual { layer_index: base_layer, width: cell.width, height: cell.height, ..visual }
     }
 
     fn decode_sprite_cell(&mut self, sprite_id: u32) -> Option<DecodedSpriteCell> {
@@ -182,35 +210,36 @@ impl SpriteResolver {
         let col = offset % cols;
         let row = offset / cols;
 
-        // Coordenadas do canto superior-esquerdo da célula na sheet decodificada
+        // Coordenadas do canto superior-esquerdo da célula na sheet decodificada.
         let x0 = (col * sw) as usize;
         let y0 = (row * sh) as usize;
-
-        // Região 32×32 a extrair (conforme SpriteLayout do RME):
-        // - 1x1 / 2x2: canto sup.-esq. (32×32)
-        // - 2x1: metade direita (x0+32, y0)
-        // - 1x2: metade inferior (x0, y0+32)
-        let (sx, sy) = match sheet_info.sprite_type {
-            editor_formats::catalog::SpriteLayout::TwoByOne => (x0 + 32, y0),
-            editor_formats::catalog::SpriteLayout::OneByTwo => (x0, y0 + 32),
-            _ => (x0, y0),
-        };
-
-        // Extrair 32×32 RGBA da sheet (BGRA→RGBA já feito no decode)
-        let mut cell = [0u8; 32 * 32 * 4];
+        let width = (sw / 32) as u8;
+        let height = (sh / 32) as u8;
+        let mut cells = Vec::with_capacity(width as usize * height as usize);
         let sheet_w = SHEET_SIZE as usize;
-        for dy in 0..32 {
-            let src_row = (sy + dy) * sheet_w * 4 + sx * 4;
-            let dst_row = dy * 32 * 4;
-            cell[dst_row..dst_row + 128].copy_from_slice(&sheet.pixels_rgba[src_row..src_row + 128]);
+        for part_y in 0..height as usize {
+            for part_x in 0..width as usize {
+                let sx = x0 + part_x * 32;
+                let sy = y0 + part_y * 32;
+                let mut cell = [0u8; 32 * 32 * 4];
+                for dy in 0..32 {
+                    let src_row = (sy + dy) * sheet_w * 4 + sx * 4;
+                    let dst_row = dy * 32 * 4;
+                    cell[dst_row..dst_row + 128]
+                        .copy_from_slice(&sheet.pixels_rgba[src_row..src_row + 128]);
+                }
+                cells.push(cell);
+            }
         }
 
         Some(DecodedSpriteCell {
-            rgba: cell,
+            cells,
+            width,
+            height,
             sheet_file: sheet_info.file,
             layout: sheet_info.sprite_type,
-            cell_x: sx,
-            cell_y: sy,
+            cell_x: x0,
+            cell_y: y0,
         })
     }
 

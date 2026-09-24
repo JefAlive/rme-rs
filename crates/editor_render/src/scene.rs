@@ -45,12 +45,7 @@ impl ChunkGpuCache {
                     let mut elevation = 0.0;
                     if let Some(ground) = &tile.ground {
                         let visual = resolve_visual(ground.type_id, pos);
-                        grounds.push(TileInstance {
-                            world_pos: [pos.x as f32, pos.y as f32],
-                            pixel_offset: [visual.draw_offset[0], visual.draw_offset[1] - elevation],
-                            layer_index: visual.layer_index,
-                            tint: [1.0, 1.0, 1.0, 1.0],
-                        });
+                        append_visual_instances(&mut grounds, pos, visual, elevation);
                         elevation += visual.elevation;
                     }
 
@@ -63,12 +58,7 @@ impl ChunkGpuCache {
                         if item_layers.len() <= stack_index {
                             item_layers.resize_with(stack_index + 1, Vec::new);
                         }
-                        item_layers[stack_index].push(TileInstance {
-                            world_pos: [pos.x as f32, pos.y as f32],
-                            pixel_offset: [visual.draw_offset[0], visual.draw_offset[1] - elevation],
-                            layer_index: visual.layer_index,
-                            tint: [1.0, 1.0, 1.0, 1.0],
-                        });
+                        append_visual_instances(&mut item_layers[stack_index], pos, visual, elevation);
                         elevation += visual.elevation;
                     }
                 }
@@ -112,6 +102,28 @@ impl ChunkGpuCache {
                     pass.draw(0..4, 0..*count);
                 }
             }
+        }
+    }
+}
+
+fn append_visual_instances(
+    instances: &mut Vec<TileInstance>,
+    pos: Position,
+    visual: crate::assets::ItemVisual,
+    elevation: f32,
+) {
+    let width = visual.width.max(1) as u32;
+    let height = visual.height.max(1) as u32;
+    for part_y in 0..height {
+        for part_x in 0..width {
+            let x_offset = part_x as i32 - (width as i32 - 1);
+            let y_offset = part_y as i32 - (height as i32 - 1);
+            instances.push(TileInstance {
+                world_pos: [pos.x as f32 + x_offset as f32, pos.y as f32 + y_offset as f32],
+                pixel_offset: [visual.draw_offset[0], visual.draw_offset[1] - elevation],
+                layer_index: visual.layer_index + part_y * width + part_x,
+                tint: [1.0, 1.0, 1.0, 1.0],
+            });
         }
     }
 }
