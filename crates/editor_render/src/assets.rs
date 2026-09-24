@@ -110,9 +110,12 @@ impl SpriteResolver {
         ItemVisual { anim_id, draw_offset, elevation }
     }
 
+    /// `device` não é mais usado internamente (AnimTable não recria buffers
+    /// em runtime), mas mantido no parâmetro para não mexer na assinatura
+    /// pública chamada por `tabs.rs`.
     fn anim_id_for(
         &mut self,
-        device: &wgpu::Device,
+        _device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut SpriteAtlas,
         anim_table: &mut AnimTable,
@@ -157,11 +160,11 @@ impl SpriteResolver {
                 for sprite_id in sprite_ids {
                     frame_layers.push(self.resolve_sprite_layer(queue, atlas, sprite_id));
                 }
-                anim_table.push_animated(device, queue, &frame_layers, duration_ms, async_animation)
+                anim_table.push_animated(queue, &frame_layers, duration_ms, async_animation)
             }
             AnimSpec::Static(sprite_id) => {
                 let layer = self.resolve_sprite_layer(queue, atlas, sprite_id);
-                anim_table.push_static(device, queue, layer)
+                anim_table.push_static(queue, layer)
             }
         };
 
@@ -176,7 +179,6 @@ impl SpriteResolver {
         if sprite_id == 0 { return 0; }
         if let Some(slot) = atlas.get_slot(sprite_id) {
             self.cache_hits += 1;
-            eprintln!("[atlas] sprite {sprite_id} veio do cache (slot {slot})");
             return slot;
         }
         let Some(cell) = self.decode_sprite_cell(sprite_id) else {
@@ -185,10 +187,7 @@ impl SpriteResolver {
         };
         let slot = atlas.insert(queue, sprite_id, &cell.rgba);
         self.resolved += 1;
-        eprintln!(
-            "[atlas] sprite {sprite_id} carregado para o atlas (slot {slot}) | sheet={} cell=({},{})",
-            cell.sheet_file, cell.cell_x, cell.cell_y,
-        );
+        let _ = &cell.sheet_file; // mantido apenas p/ debug pontual, se precisar
         slot
     }
 

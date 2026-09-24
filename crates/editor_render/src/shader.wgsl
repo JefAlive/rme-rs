@@ -17,11 +17,15 @@ struct AnimEntry {
     frame_duration_ms: u32,
     mode: u32,
 };
-const MAX_ANIM_ENTRIES: u32 = 8192u;
-const MAX_ANIM_FRAMES: u32 = 32768u;
 
-@group(2) @binding(0) var<storage, read> anim_entries: array<AnimEntry, 8192>;
-@group(2) @binding(1) var<storage, read> anim_frames: array<u32, 32768>;
+// Tamanho FIXO — precisa bater exatamente com MAX_ANIM_ENTRIES/MAX_ANIM_FRAMES
+// em anim.rs. 65536 = u16::MAX + 1: cobre TODO o espaço de type_id possível,
+// então um anim_id nunca pode ultrapassar essa capacidade em uso real.
+const MAX_ANIM_ENTRIES: u32 = 65536u;
+const MAX_ANIM_FRAMES: u32 = 262144u;
+
+@group(2) @binding(0) var<storage, read> anim_entries: array<AnimEntry, 65536>;
+@group(2) @binding(1) var<storage, read> anim_frames: array<u32, 262144>;
 
 struct VsIn {
     @location(0) quad_pos: vec2<f32>,

@@ -1,7 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 
 /// Uma entrada por *tipo de item* (estático ou animado), nunca por
-/// instância — poucas centenas de entradas mesmo com milhares de tiles.
+/// instância — poucas centenas/milhares de entradas mesmo com milhares de tiles.
 /// `mode`: 0 = síncrono (todas as instâncias do tipo animam em fase),
 /// 1 = assíncrono (fase deslocada por hash de posição, no shader).
 #[repr(C)]
@@ -13,30 +13,45 @@ pub struct AnimEntry {
     pub mode: u32,
 }
 
-/// Duas storage buffers: `entries` (uma por tipo resolvido) e `frames`
-/// (índices de layer do atlas, concatenados por entrada). Cresce sob
-/// demanda dobrando a capacidade — mesmo padrão do `SpriteAtlas`.
+/// Capacidade FIXA, pré-alocada por completo desde a criação — precisa bater
+/// exatamente com as constantes `MAX_ANIM_ENTRIES`/`MAX_ANIM_FRAMES` no
+/// shader.wgsl. Arrays de tamanho dinâmico em storage buffers exigem a
+/// feature GPU DYNAMIC_ARRAY_SIZE, que o backend GLES não suporta; por isso
+/// alocamos o máximo realista de uma vez e NUNCA recriamos o buffer.
+///
+/// 65536 = u16::MAX + 1, cobrindo TODO o espaço possível de `type_id` — um
+/// `anim_id` (que é atribuído 1:1 por type_id via `anim_cache`) jamais pode
+/// ultrapassar essa capacidade. Isso elimina de vez a classe de bug onde
+/// tipos além da capacidade colapsavam todos no mesmo slot (o "efeito 8192"
+/// que causava sprites errados/trocados de forma aparentemente aleatória,
+/// já que a ordem de atribuição de anim_id segue a ordem de iteração de um
+/// AHashMap, não a ordem numérica do type_id).
+pub const MAX_ANIM_ENTRIES: u32 = 65536;
+pub const MAX_ANIM_FRAMES: u32 = 262144;
+
 pub struct AnimTable {
-    entries: Vec<AnimEntry>,
-    frames: Vec<u32>,
+    entries_len: u32,
+    frames_len: u32,
     entries_buf: wgpu::Buffer,
     frames_buf: wgpu::Buffer,
-    entries_cap: u32,
-    frames_cap: u32,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
 }
 
-pub const INITIAL_ENTRIES_CAP: u32 = 8192;
-pub const INITIAL_FRAMES_CAP: u32 = 32768;
-
 impl AnimTable {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let entries_buf = Self::make_buf(
-            device, "anim_entries",
-            INITIAL_ENTRIES_CAP as u64 * std::mem::size_of::<AnimEntry>() as u64,
-        );
-        let frames_buf = Self::make_buf(device, "anim_frames", INITIAL_FRAMES_CAP as u64 * 4);
+        let entries_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("anim_entries"),
+            size: MAX_ANIM_ENTRIES as u64 * std::mem::size_of::<AnimEntry>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let frames_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("anim_frames"),
+            size: MAX_ANIM_FRAMES as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("anim_bgl"),
@@ -59,94 +74,76 @@ impl AnimTable {
                 },
             ],
         });
-        let bind_group = Self::make_bind_group(device, &bind_group_layout, &entries_buf, &frames_buf);
 
-        let mut table = Self {
-            entries: Vec::new(), frames: Vec::new(),
-            entries_buf, frames_buf,
-            entries_cap: INITIAL_ENTRIES_CAP, frames_cap: INITIAL_FRAMES_CAP,
-            bind_group_layout, bind_group,
-        };
-
-        // anim_id 0 reservado: 1 frame apontando para a layer 0 (transparente
-        // no atlas) — sentinela para type_id desconhecido/vazio.
-        table.push_static(device, queue, 0);
-        table
-    }
-
-    fn make_buf(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
-        device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: size.max(4),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
-    }
-
-    fn make_bind_group(
-        device: &wgpu::Device, layout: &wgpu::BindGroupLayout,
-        entries_buf: &wgpu::Buffer, frames_buf: &wgpu::Buffer,
-    ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("anim_bg"), layout,
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("anim_bg"), layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: entries_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: frames_buf.as_entire_binding() },
             ],
-        })
+        });
+
+        let mut table = Self {
+            entries_len: 0,
+            frames_len: 0,
+            entries_buf,
+            frames_buf,
+            bind_group_layout,
+            bind_group,
+        };
+
+        // anim_id 0 reservado: 1 frame apontando para o slot 0 (transparente
+        // no atlas) — sentinela para type_id desconhecido/vazio.
+        table.push_static(queue, 0);
+        table
     }
 
-    fn ensure_entries_capacity(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u32) {
-        if needed <= self.entries_cap { return; }
-        let mut cap = self.entries_cap;
-        while cap < needed { cap = cap.saturating_mul(2); }
-        let new_buf = Self::make_buf(device, "anim_entries", cap as u64 * std::mem::size_of::<AnimEntry>() as u64);
-        queue.write_buffer(&new_buf, 0, bytemuck::cast_slice(&self.entries));
-        self.entries_buf = new_buf;
-        self.entries_cap = cap;
-        self.bind_group = Self::make_bind_group(device, &self.bind_group_layout, &self.entries_buf, &self.frames_buf);
-    }
-
-    fn ensure_frames_capacity(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed: u32) {
-        if needed <= self.frames_cap { return; }
-        let mut cap = self.frames_cap;
-        while cap < needed { cap = cap.saturating_mul(2); }
-        let new_buf = Self::make_buf(device, "anim_frames", cap as u64 * 4);
-        queue.write_buffer(&new_buf, 0, bytemuck::cast_slice(&self.frames));
-        self.frames_buf = new_buf;
-        self.frames_cap = cap;
-        self.bind_group = Self::make_bind_group(device, &self.bind_group_layout, &self.entries_buf, &self.frames_buf);
-    }
-
-    /// Registra um item estático (1 frame) apontando para `layer`.
-    pub fn push_static(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layer: u32) -> u32 {
-        self.push_animated(device, queue, &[layer], 1, false)
+    /// Registra um item estático (1 frame) apontando para `slot` do atlas.
+    pub fn push_static(&mut self, queue: &wgpu::Queue, slot: u32) -> u32 {
+        self.push_animated(queue, &[slot], 1, false)
     }
 
     /// Registra um item animado (N frames), devolve o `anim_id`.
+    /// Loga um erro (sem travar) se a capacidade fixa for excedida — dado
+    /// que MAX_ANIM_ENTRIES cobre todo o espaço de u16, isso não deveria
+    /// acontecer nunca em uso real; se aparecer no console, é sinal de bug
+    /// em outro lugar (ex: anim_cache não estar deduplicando corretamente).
     pub fn push_animated(
-        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        &mut self, queue: &wgpu::Queue,
         frame_layers: &[u32], frame_duration_ms: u32, async_mode: bool,
     ) -> u32 {
-        let first_frame = self.frames.len() as u32;
-        self.ensure_frames_capacity(device, queue, first_frame + frame_layers.len() as u32);
-        self.frames.extend_from_slice(frame_layers);
+        let first_frame = self.frames_len;
+        let needed_frames = first_frame + frame_layers.len() as u32;
+        if needed_frames > MAX_ANIM_FRAMES {
+            eprintln!(
+                "[anim] ERRO: capacidade de frames excedida ({needed_frames} > {MAX_ANIM_FRAMES}); \
+                 aumente MAX_ANIM_FRAMES em anim.rs e shader.wgsl"
+            );
+            return 0;
+        }
         queue.write_buffer(&self.frames_buf, first_frame as u64 * 4, bytemuck::cast_slice(frame_layers));
+        self.frames_len = needed_frames;
 
-        let id = self.entries.len() as u32;
-        self.ensure_entries_capacity(device, queue, id + 1);
+        let id = self.entries_len;
+        if id >= MAX_ANIM_ENTRIES {
+            eprintln!(
+                "[anim] ERRO: capacidade de entradas excedida ({id} >= {MAX_ANIM_ENTRIES}); \
+                 isso não deveria acontecer (MAX_ANIM_ENTRIES cobre todo u16). Verifique anim_cache."
+            );
+            return 0;
+        }
         let entry = AnimEntry {
             first_frame,
             frame_count: frame_layers.len().max(1) as u32,
             frame_duration_ms: frame_duration_ms.max(1),
             mode: if async_mode { 1 } else { 0 },
         };
-        self.entries.push(entry);
         queue.write_buffer(
             &self.entries_buf,
             id as u64 * std::mem::size_of::<AnimEntry>() as u64,
             bytemuck::cast_slice(&[entry]),
         );
+        self.entries_len += 1;
         id
     }
 }

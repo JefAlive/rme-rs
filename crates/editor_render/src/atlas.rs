@@ -130,10 +130,18 @@ impl SpriteAtlas {
             self.next_slot = 1; // substitui os mais antigos
         }
 
-        // Se o slot já possuía outro sprite, remove do mapa
+        // Se o slot já possuía outro sprite, remove do mapa — e AVISA, porque
+        // isso significa que algum item já desenhado com esse slot vai passar
+        // a mostrar o sprite NOVO silenciosamente (mesma classe de bug do
+        // clamp de anim_id, só que pelo lado do atlas).
         let old_sprite = self.slot_to_sprite[slot as usize];
         if old_sprite != 0 && old_sprite != sprite_id {
             self.sprite_to_slot.remove(&old_sprite);
+            eprintln!(
+                "[atlas] AVISO: slot {slot} reciclado — sprite {old_sprite} substituído por {sprite_id}. \
+                 Atlas cheio ({} slots); se isto aparecer com frequência, ATLAS_SIZE precisa crescer.",
+                self.total_slots
+            );
         }
         self.slot_to_sprite[slot as usize] = sprite_id;
         self.sprite_to_slot.insert(sprite_id, slot);
@@ -145,11 +153,7 @@ impl SpriteAtlas {
             wgpu::ImageCopyTexture {
                 texture: &self.texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: col * SPRITE_SIZE,
-                    y: row * SPRITE_SIZE,
-                    z: 0,
-                },
+                origin: wgpu::Origin3d { x: col * SPRITE_SIZE, y: row * SPRITE_SIZE, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             rgba,
@@ -158,11 +162,7 @@ impl SpriteAtlas {
                 bytes_per_row: Some(SPRITE_SIZE * 4),
                 rows_per_image: Some(SPRITE_SIZE),
             },
-            wgpu::Extent3d {
-                width: SPRITE_SIZE,
-                height: SPRITE_SIZE,
-                depth_or_array_layers: 1,
-            },
+            wgpu::Extent3d { width: SPRITE_SIZE, height: SPRITE_SIZE, depth_or_array_layers: 1 },
         );
 
         slot
