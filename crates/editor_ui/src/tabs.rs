@@ -371,20 +371,27 @@ impl<'a> EditorTabViewer<'a> {
                 }
             }
 
-            // Pilha de andares a compor: distância do andar atual define alfa
-            // e deslocamento diagonal; o andar atual (distância 0) é desenhado
-            // por último, opaco, por cima do contexto semitransparente.
+            // O RME desenha como mapas completos apenas os floors entre o
+            // início da pilha e o floor selecionado. Floors abaixo dele
+            // (z menor) não fazem parte da composição: incluir esses tiles
+            // deixa, por exemplo, o floor 2 visível através de áreas vazias
+            // do floor 5. O overlay translúcido de floor-1 é separado e não
+            // entra aqui.
+            // Alinha os andares segundo getDrawPosition do RME: z=7 é a
+            // origem no térreo e acima; no subsolo, usa o floor selecionado.
             let mut layers: Vec<editor_render::scene::FloorLayer> = Vec::new();
             {
-                let mut z = start_z;
+                let mut z = start_z as i32;
                 loop {
-                    let distance = (end_z as i32 - z as i32).unsigned_abs() as f32;
+                    let ground_z = editor_core::position::GROUND_FLOOR as i32;
+                    let reference_z = if z <= ground_z { ground_z } else { end_z as i32 };
+                    let screen_shift = (reference_z - z) as f32 * 32.0;
                     layers.push(editor_render::scene::FloorLayer {
-                        z,
-                        alpha: if z == end_z { 1.0 } else { 0.35 },
-                        pixel_offset: [distance * 32.0, distance * 32.0],
+                        z: z as u8,
+                        alpha: 1.0,
+                        pixel_offset: [screen_shift, screen_shift],
                     });
-                    if z == superend_z { break; }
+                    if z as u8 == end_z { break; }
                     z -= 1;
                 }
             }
