@@ -14,8 +14,9 @@ struct Camera {
 struct VsIn {
     @location(0) quad_pos: vec2<f32>,
     @location(1) world_pos: vec2<f32>,
-    @location(2) layer_index: u32,
-    @location(3) tint: vec4<f32>,
+    @location(2) pixel_offset: vec2<f32>,
+    @location(3) layer_index: u32,
+    @location(4) tint: vec4<f32>,
 };
 
 struct VsOut {
@@ -29,7 +30,7 @@ const TILE_SIZE: f32 = 32.0;
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    let world = (in.world_pos * TILE_SIZE + in.quad_pos * TILE_SIZE - camera.offset) * camera.zoom;
+    let world = (in.world_pos * TILE_SIZE + in.pixel_offset + in.quad_pos * TILE_SIZE - camera.offset) * camera.zoom;
     let ndc = vec2<f32>(
         (world.x / camera.viewport_size.x) * 2.0 - 1.0,
         1.0 - (world.y / camera.viewport_size.y) * 2.0,

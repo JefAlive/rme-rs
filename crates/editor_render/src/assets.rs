@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use editor_formats::appearances::{ItemTypeTable, load_appearances};
 use editor_formats::catalog::{Catalog, parse_catalog, SpriteSheetInfo};
 use editor_formats::sprite::{decode_sheet, SHEET_SIZE};
+use editor_core::position::Position;
 
 use crate::atlas::SpriteAtlas;
 
@@ -35,6 +36,15 @@ pub struct SpriteResolver {
     cache_hits: u64,
     decode_failures: u64,
     atlas_full: u32,
+    diagnosed_missing_types: AHashSet<u16>,
+    diagnosed_missing_sprites: AHashSet<u32>,
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct ItemVisual {
+    pub layer_index: u32,
+    pub draw_offset: [f32; 2],
+    pub elevation: f32,
 }
 
 impl SpriteResolver {
@@ -65,44 +75,80 @@ impl SpriteResolver {
             cache_hits: 0,
             decode_failures: 0,
             atlas_full: 0,
+            diagnosed_missing_types: AHashSet::new(),
+            diagnosed_missing_sprites: AHashSet::new(),
         })
     }
 
     /// Resolve `type_id` para o índice da layer no atlas, decodificando a célula
     /// sob demanda e fazendo upload via `atlas.append`.
-    pub fn layer_for(
+    pub fn visual_for(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         atlas: &mut SpriteAtlas,
         type_id: u16,
-    ) -> u32 {
+        position: Position,
+    ) -> ItemVisual {
         if type_id == 0 {
-            return 0; // layer 0 = transparente
+            return ItemVisual::default();
         }
 
         let Some(item_type) = self.table.get_opt(type_id) else {
-            return 0;
+            if self.diagnosed_missing_types.insert(type_id) {
+                eprintln!("sprite resolver: type_id={type_id} não existe em appearances.dat");
+            }
+            return ItemVisual::default();
         };
 
-        let Some(&sprite_id) = item_type.sprite_ids.first() else {
-            return 0;
+        let (offset_x, offset_y) = item_type.draw_offset();
+        let visual = ItemVisual {
+            layer_index: 0,
+            draw_offset: [offset_x as f32, offset_y as f32],
+            elevation: if item_type.has_elevation { item_type.draw_height() as f32 } else { 0.0 },
+        };
+
+        // Em itens com padrões (paredes, portas, bordas etc.), o RME escolhe
+        // o sprite conforme a posição do tile. Usar sempre sprite_ids[0]
+        // fazia várias dessas aparências apontarem para a célula errada.
+        let sprite_index = item_type.sprite_index(
+            0,
+            position.x as u32,
+            position.y as u32,
+            position.z as u32,
+            0,
+        );
+        let Some(&sprite_id) = item_type
+            .sprite_ids
+            .get(sprite_index)
+            .or_else(|| item_type.sprite_ids.first())
+        else {
+            if self.diagnosed_missing_types.insert(type_id) {
+                eprintln!("sprite resolver: type_id={type_id} sem sprite_ids em appearances.dat");
+            }
+            return visual;
         };
 
         if sprite_id == 0 {
-            return 0;
+            if self.diagnosed_missing_types.insert(type_id) {
+                eprintln!("sprite resolver: type_id={type_id} resolve para sprite_id=0");
+            }
+            return visual;
         }
 
         // Cache hit?
         if let Some(&layer) = self.sprite_layer.get(&sprite_id) {
             self.cache_hits += 1;
-            return layer;
+            return ItemVisual { layer_index: layer, ..visual };
         }
 
         // Decodificar sheet → célula RGBA 32×32
         let Some(cell) = self.decode_sprite_cell(sprite_id) else {
             self.decode_failures += 1;
-            return 0;
+            if self.diagnosed_missing_sprites.insert(sprite_id) {
+                eprintln!("sprite resolver: falha ao decodificar sprite_id={sprite_id} para type_id={type_id}");
+            }
+            return visual;
         };
 
         // Upload no atlas
@@ -110,7 +156,7 @@ impl SpriteResolver {
         if layer == 0 {
             self.atlas_full += 1;
             eprintln!("sprite resolver: atlas cheio (max_layers={}) sprite_id={sprite_id}", atlas.max_layers());
-            return 0;
+            return visual;
         }
 
         self.sprite_layer.insert(sprite_id, layer);
@@ -119,7 +165,7 @@ impl SpriteResolver {
             "sprite resolver: type_id={type_id} sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) layer={layer}",
             cell.sheet_file, cell.layout, cell.cell_x, cell.cell_y,
         );
-        layer
+        ItemVisual { layer_index: layer, ..visual }
     }
 
     fn decode_sprite_cell(&mut self, sprite_id: u32) -> Option<DecodedSpriteCell> {

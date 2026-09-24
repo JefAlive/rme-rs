@@ -5,7 +5,13 @@ use crate::{instance::TileInstance, offscreen::OffscreenTarget, pipeline::{Camer
 
 #[derive(Default)]
 pub struct ChunkGpuCache {
-    buffers: AHashMap<ChunkCoord, (wgpu::Buffer, u32)>,
+    buffers: AHashMap<ChunkCoord, ChunkBuffers>,
+}
+
+#[derive(Default)]
+struct ChunkBuffers {
+    ground: Option<(wgpu::Buffer, u32)>,
+    item_layers: Vec<Option<(wgpu::Buffer, u32)>>,
 }
 
 impl ChunkGpuCache {
@@ -16,14 +22,17 @@ impl ChunkGpuCache {
         device: &wgpu::Device,
         map: &mut SpatialMap,
         floor: u8,
-        mut resolve_layer: impl FnMut(u16) -> u32,
+        mut resolve_visual: impl FnMut(u16, Position) -> crate::assets::ItemVisual,
     ) {
         let dirty: Vec<ChunkCoord> = map.iter_dirty_chunks()
             .filter(|(c, _)| c.z == floor)
             .map(|(c, _)| *c)
             .collect();
+        let mut ground_count = 0usize;
+        let mut stacked_count = 0usize;
         for coord in dirty {
-            let mut instances = Vec::with_capacity(256);
+            let mut grounds = Vec::with_capacity(1024);
+            let mut item_layers: Vec<Vec<TileInstance>> = Vec::new();
             for local_idx in 0..(CHUNK_SIZE as usize * CHUNK_SIZE as usize) {
                 let lx = (local_idx % CHUNK_SIZE as usize) as u16;
                 let ly = (local_idx / CHUNK_SIZE as usize) as u16;
@@ -33,36 +42,92 @@ impl ChunkGpuCache {
                     z: coord.z,
                 };
                 if let Some(tile) = map.get_tile(pos) {
+                    let mut elevation = 0.0;
                     if let Some(ground) = &tile.ground {
-                        instances.push(TileInstance {
+                        let visual = resolve_visual(ground.type_id, pos);
+                        grounds.push(TileInstance {
                             world_pos: [pos.x as f32, pos.y as f32],
-                            layer_index: resolve_layer(ground.type_id),
+                            pixel_offset: [visual.draw_offset[0], visual.draw_offset[1] - elevation],
+                            layer_index: visual.layer_index,
                             tint: [1.0, 1.0, 1.0, 1.0],
                         });
+                        elevation += visual.elevation;
+                    }
+
+                    // Cada índice da pilha vira uma passada separada. Assim,
+                    // todos os grounds do andar são desenhados antes do
+                    // primeiro item, mesmo quando sprites avançam sobre SQMs
+                    // vizinhos. A ordem de tile.items preserva bottom → top.
+                    for (stack_index, item) in tile.items.iter().enumerate() {
+                        let visual = resolve_visual(item.type_id, pos);
+                        if item_layers.len() <= stack_index {
+                            item_layers.resize_with(stack_index + 1, Vec::new);
+                        }
+                        item_layers[stack_index].push(TileInstance {
+                            world_pos: [pos.x as f32, pos.y as f32],
+                            pixel_offset: [visual.draw_offset[0], visual.draw_offset[1] - elevation],
+                            layer_index: visual.layer_index,
+                            tint: [1.0, 1.0, 1.0, 1.0],
+                        });
+                        elevation += visual.elevation;
                     }
                 }
             }
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("chunk_instances"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            self.buffers.insert(coord, (buffer, instances.len() as u32));
+            let buffers = ChunkBuffers {
+                ground: upload_instances(device, "chunk_ground", &grounds),
+                item_layers: item_layers.iter().map(|items| upload_instances(device, "chunk_item_layer", items)).collect(),
+            };
+            ground_count += grounds.len();
+            stacked_count += item_layers.iter().map(Vec::len).sum::<usize>();
+            self.buffers.insert(coord, buffers);
             map.clear_dirty(&coord);
+        }
+        if ground_count + stacked_count > 0 {
+            eprintln!("render cache z={floor}: grounds={ground_count}, stacked_items={stacked_count}");
         }
     }
 
     /// Desenha só os chunks do andar `z` — usado para compor a pilha
-    /// multi-andar, um draw call por `FloorLayer`.
+    /// multi-andar. Primeiro todos os grounds; depois a pilha item por item.
     fn draw_floor<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, z: u8) {
-        for (coord, (buf, count)) in self.buffers.iter() {
-            if coord.z != z || *count == 0 {
-                continue;
+        for (coord, buffers) in self.buffers.iter() {
+            if coord.z == z {
+                if let Some((buf, count)) = &buffers.ground {
+                    pass.set_vertex_buffer(1, buf.slice(..));
+                    pass.draw(0..4, 0..*count);
+                }
             }
-            pass.set_vertex_buffer(1, buf.slice(..));
-            pass.draw(0..4, 0..*count);
+        }
+
+        let layer_count = self.buffers.iter()
+            .filter(|(coord, _)| coord.z == z)
+            .map(|(_, buffers)| buffers.item_layers.len())
+            .max()
+            .unwrap_or(0);
+        for layer in 0..layer_count {
+            for (coord, buffers) in self.buffers.iter() {
+                if coord.z != z { continue; }
+                if let Some(Some((buf, count))) = buffers.item_layers.get(layer) {
+                    pass.set_vertex_buffer(1, buf.slice(..));
+                    pass.draw(0..4, 0..*count);
+                }
+            }
         }
     }
+}
+
+fn upload_instances(
+    device: &wgpu::Device,
+    label: &'static str,
+    instances: &[TileInstance],
+) -> Option<(wgpu::Buffer, u32)> {
+    if instances.is_empty() { return None; }
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(instances),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    Some((buffer, instances.len() as u32))
 }
 
 /// Um andar a compor no frame: `alpha` controla a transparência (1.0 = andar

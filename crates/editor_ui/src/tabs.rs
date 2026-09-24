@@ -339,11 +339,11 @@ impl<'a> EditorTabViewer<'a> {
                 let doc = &mut self.state.documents[doc_index];
                 let mut z = start_z;
                 loop {
-                    let resolver = |type_id: u16| -> u32 {
+                    let resolver = |type_id: u16, position: editor_core::position::Position| -> editor_render::assets::ItemVisual {
                         let (Some(resolver), Some(atlas)) = (sprite_resolver.as_mut(), atlas_for_resolve.as_mut()) else {
-                            return 0;
+                            return editor_render::assets::ItemVisual::default();
                         };
-                        resolver.layer_for(device, queue, atlas, type_id)
+                        resolver.visual_for(device, queue, atlas, type_id, position)
                     };
                     self.state.chunk_cache.sync_for_floor(device, &mut doc.map, z, resolver);
                     if z == superend_z { break; }

@@ -115,6 +115,8 @@ impl RmeApp {
         let mut per_floor: std::collections::BTreeMap<u8, (u64, u64)> = std::collections::BTreeMap::new();
         let mut grounds_z7: u64 = 0;
         let mut items_z7: u64 = 0;
+        let mut stacked_items_z7: u64 = 0;
+        let mut unknown_types_z7: u64 = 0;
         for t in &doc.tiles {
             let entry = per_floor.entry(t.z).or_default();
             entry.0 += 1;
@@ -128,6 +130,16 @@ impl RmeApp {
                     grounds_z7 += 1;
                 }
                 items_z7 += t.items.len() as u64;
+                for item in &t.items {
+                    match table.get_opt(item.id) {
+                        Some(ty) if ty.group == editor_formats::appearances::ItemGroup::Ground => {}
+                        Some(_) => stacked_items_z7 += 1,
+                        None => {
+                            stacked_items_z7 += 1;
+                            unknown_types_z7 += 1;
+                        }
+                    }
+                }
             }
         }
 
@@ -143,7 +155,7 @@ impl RmeApp {
         for (z, (tiles, items)) in &per_floor {
             eprintln!("import OTBM: z={z} tiles={tiles} items={items}");
         }
-        eprintln!("import OTBM: z=7 ground_tiles={grounds_z7} items={items_z7}");
+        eprintln!("import OTBM: z=7 ground_tiles={grounds_z7} raw_items={items_z7} stacked_items={stacked_items_z7} unknown_type_ids={unknown_types_z7}");
 
         Ok(bounds)
     }
