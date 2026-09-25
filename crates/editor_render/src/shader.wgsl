@@ -6,6 +6,10 @@ struct Camera {
     viewport_size: vec2<f32>,
     floor_alpha: f32,
     sampling_mode: u32,
+    // Luz ambiente global, metodo do Tibia: multiplica a cena (0 = escuro,
+    // 1 = claro). O fósforo continua emitindo (o bloom recupera o brilho
+    // original dividindo por este valor), só o ambiente escurece.
+    light: f32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -228,5 +232,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // A cena intermediária é sempre formada por pixels originais. O filtro é
     // aplicado depois, sobre o ground e todos os itens já compostos.
     let sampled = nearest_sample(in.layer, in.uv) * in.tint;
-    return vec4<f32>(sampled.rgb, sampled.a * camera.floor_alpha);
+    return vec4<f32>(sampled.rgb * camera.light, sampled.a * camera.floor_alpha);
 }

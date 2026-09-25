@@ -42,13 +42,14 @@ struct Super2xSaiUniform {
     _padding: [f32; 2],
 }
 
-/// Uniform dos shaders MDAPT e CRT bloom: só o tamanho da textura de origem
-/// (bloco std140 `vec2 TextureSize; vec2 _unused;` = 16 bytes).
+/// Uniform dos shaders MDAPT e CRT bloom: tamanho da textura de origem +
+/// parâmetros. Bloco std140 `vec2 TextureSize; vec2 Params;` = 16 bytes.
+/// MDAPT só lê TextureSize; o bloom lê Params.x = WorldLight (0..1).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct TexSizeUniform {
     texture_size: [f32; 2],
-    _padding: [f32; 2],
+    params: [f32; 2],
 }
 
 pub struct ScaleResources {
@@ -165,7 +166,7 @@ impl ScaleResources {
         });
         let uniform_tex_size = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene_scaler_tex_size_uniform"),
-            contents: bytemuck::bytes_of(&TexSizeUniform { texture_size: [1.0, 1.0], _padding: [0.0; 2] }),
+            contents: bytemuck::bytes_of(&TexSizeUniform { texture_size: [1.0, 1.0], params: [0.0; 2] }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -451,7 +452,7 @@ impl ScaleResources {
     pub fn render_mdapt(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &SceneTarget, t: [&SceneTarget; 4]) {
         queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
             texture_size: [scene.width as f32, scene.height as f32],
-            _padding: [0.0; 2],
+            params: [0.0; 2],
         }));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene_scaler_mdapt_pass") });
 
@@ -471,10 +472,14 @@ impl ScaleResources {
 
     /// CRT bloom (halo de fósforo, sem scanlines) aplicado na imagem final já
     /// upscaled. Amostra com o sampler linear (offsets de halo fracionários).
-    pub fn post_bloom(&self, device: &wgpu::Device, queue: &wgpu::Queue, source_size: (u32, u32), source: &wgpu::TextureView, target: &wgpu::TextureView) {
+    /// `world_light` em [0,1] (metodo Tibia): menor valor = glow mais ativo
+    /// (estilo neon 80s), maior valor = glow atenuado (sem embranquecer).
+    pub fn post_bloom(&self, device: &wgpu::Device, queue: &wgpu::Queue,
+                      source_size: (u32, u32), source: &wgpu::TextureView,
+                      target: &wgpu::TextureView, world_light: f32) {
         queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
             texture_size: [source_size.0 as f32, source_size.1 as f32],
-            _padding: [0.0; 2],
+            params: [world_light, 0.0],
         }));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene_scaler_bloom_bg"), layout: &self.layout_crt_bloom,

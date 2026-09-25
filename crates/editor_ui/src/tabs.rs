@@ -541,6 +541,8 @@ impl<'a> EditorTabViewer<'a> {
                 viewport_size: [scene_width as f32, scene_height as f32],
                 floor_alpha: 1.0,
                 sampling_mode: 0,
+                light: self.state.world_light as f32 / 100.0,
+                _pad_light: 0,
             };
             if let (Some(resources), Some(atlas), Some(scene), Some(output), Some(scaler)) = (
                 &self.state.tile_resources, &self.state.atlas, &self.state.scene_target,
@@ -582,7 +584,8 @@ impl<'a> EditorTabViewer<'a> {
                     if let Some(post) = &self.state.post_target {
                         let post_size = (output.width, output.height);
                         if self.state.shaders.crt_bloom {
-                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view);
+                            let wl = self.state.world_light as f32 / 100.0;
+                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view, wl);
                             if self.state.shaders.crt_color {
                                 scaler.post_color(device, queue, &post.view, &output.view);
                             } else {
@@ -705,10 +708,9 @@ impl<'a> EditorTabViewer<'a> {
         ui.label(RichText::new(format!("{name} — em construção")).weak());
     }
 
-    fn ui_world(&mut self, ui: &mut Ui) {
+fn ui_world(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("World Light").weak());
         ui.add(egui::Slider::new(&mut self.state.world_light, 0..=100));
-
         ui.separator();
         ui.checkbox(&mut self.state.show_tooltips, "Show Tooltips");
         ui.checkbox(&mut self.state.show_npcs, "Show NPCs");
