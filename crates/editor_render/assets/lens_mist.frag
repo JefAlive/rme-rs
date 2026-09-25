@@ -6,7 +6,10 @@
 //
 // * desacoplado do World Light: a cena já chega escura de noite (light buffer);
 // * raio do blur em px de tela (3.0) — acompanha o zoom automaticamente;
-// * Params.x = forca k (0..~0.25 no slider), Params.y reservado.
+// * foco em cores frias: força maior onde o azul domina (noite), véu com
+//   leve tirada fria;
+// * Params.x = forca k (0..~0.25 no slider), Params.y = escala do raio
+//   (drive pelo World Light: maior raio conforme mais escuro, 0 acima de 50%).
 layout(location=0) in vec2 vUV;
 layout(set=0, binding=0) uniform texture2D SrcTex;
 layout(set=0, binding=1) uniform sampler SrcSampler;
@@ -37,16 +40,24 @@ void main()
 {
 	vec2 ps = 1.0 / uniforms.TextureSize;
 	vec4 base = texture(sampler2D(SrcTex, SrcSampler), vUV);
+	float rs = max(uniforms.Params.y, 0.1);
 
 	vec3 acc = base.rgb * 1.0;
 	float wsum = 1.0;
 	for (int i = 0; i < TAPS; ++i) {
-		vec2 o = MIST_DIR[i] * (MIST_RADIUS * ps);
+		vec2 o = MIST_DIR[i] * (MIST_RADIUS * rs * ps);
 		acc += texture(sampler2D(SrcTex, SrcSampler), vUV + o).rgb * MIST_W[i];
 		wsum += MIST_W[i];
 	}
 	vec3 blurred = acc / wsum;
 
 	float k = clamp(uniforms.Params.x, 0.0, 1.0);
-	FragColor = vec4(mix(base.rgb, blurred, k), base.a);
+
+	// Foco em cores frias: a força da névoa cresce onde o azul domina (noite)
+	// e diminui nas cores quentes; o véu tem uma leve tirada fria.
+	float cool = clamp(max(base.b - base.r, 0.0) * 4.0, 0.0, 1.0);
+	float kEff = k * mix(0.4, 1.0, cool);
+	vec3 veil = blurred * vec3(0.92, 0.96, 1.08);
+
+	FragColor = vec4(mix(base.rgb, veil, kEff), base.a);
 }

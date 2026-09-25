@@ -54,6 +54,12 @@ struct TexSizeUniform {
     params: [f32; 2],
 }
 
+/// Hermite smoothstep para rampas de efeito: edge0 = sem efeito, edge1 = 100%.
+fn smoothstep01(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 pub struct ScaleResources {
     pipeline_plain: wgpu::RenderPipeline,
     pipeline_xbrz: wgpu::RenderPipeline,
@@ -688,15 +694,26 @@ impl ScaleResources {
 
     /// CRT bloom (halation de fósforo, sem scanlines) aplicado na imagem final já
     /// upscaled. Amostra com o sampler linear (offsets de halo fracionários).
-    /// Desacoplado do World Light: a força é constante e ajustável — `strength`
-    /// controla a intensidade do halo (screen blend: pretos com bleed fino,
-    /// brancos intactos). Raio por canal em `Params.y` (reservado, 1.0).
+    /// Desacoplado do fluxo de luz, mas ativo SÓ acima de 50% de World Light
+    /// (dia): `strength` é a força máxima do slider; o raio por canal aperta
+    /// progressivamente conforme `world_light` se aproxima de 100% (pegada de
+    /// monitor CRT em cena clara). Screen blend: pretos com bleed fino, brancos
+    /// intactos.
+    #[allow(clippy::too_many_arguments)]
     pub fn post_bloom(&self, device: &wgpu::Device, queue: &wgpu::Queue,
                       source_size: (u32, u32), source: &wgpu::TextureView,
-                      target: &wgpu::TextureView, strength: f32) {
+                      target: &wgpu::TextureView, strength: f32,
+                      world_light: u8) {
+        let wl = (world_light as f32 / 100.0).clamp(0.0, 1.0);
+        // Gate de dia: sem efeito em wl <= 0.5, rampa até 0.62+.
+        let ramp = smoothstep01(0.5, 0.62, wl);
+        let bloom_strength = strength * ramp;
+        // Raio: 3x maior que o default dos canais (R4/G6/B8.5), largo perto de
+        // 50% (4.2x) apertando até 1.2x em 100% — mantém o efeito de apertar.
+        let radius_scale = 4.2 - 3.0 * ramp;
         queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
             texture_size: [source_size.0 as f32, source_size.1 as f32],
-            params: [strength, 1.0],
+            params: [bloom_strength, radius_scale],
         }));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene_scaler_bloom_bg"), layout: &self.layout_crt_bloom,
@@ -712,13 +729,23 @@ impl ScaleResources {
     /// Lens mist (névoa difusa de lente, veiling glare) sobre a imagem final.
     /// out = mix(cena, blur_grosso(cena), strength): mix nunca adiciona energia,
     /// então não clareia a noite — só amacia as bordas de brilho. Sem lift de
-    /// pretos. Raio do blur em px de tela (3.0), acompanha o zoom.
+    /// pretos. Ativo SÓ abaixo de 50% de World Light (noite): `strength` é a
+    /// força máxima do slider; o raio do blur espalha progressivamente conforme
+    /// `world_light` se aproxima de 0% (névoa mais espalhada quanto mais escuro).
+    #[allow(clippy::too_many_arguments)]
     pub fn post_mist(&self, device: &wgpu::Device, queue: &wgpu::Queue,
                      source_size: (u32, u32), source: &wgpu::TextureView,
-                     target: &wgpu::TextureView, strength: f32) {
+                     target: &wgpu::TextureView, strength: f32,
+                     world_light: u8) {
+        let wl = (world_light as f32 / 100.0).clamp(0.0, 1.0);
+        // Gate de noite: sem efeito em wl >= 0.5, rampa até wl ~ 0.
+        let ramp = 1.0 - smoothstep01(0.0, 0.5, wl);
+        let mist_strength = strength * ramp;
+        // Raio: compacto perto de 50% (0.6x) espalhando até 2.2x em 0%.
+        let radius_scale = 0.6 + 1.6 * ramp;
         queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
             texture_size: [source_size.0 as f32, source_size.1 as f32],
-            params: [strength, 0.0],
+            params: [mist_strength, radius_scale],
         }));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene_scaler_lens_mist_bg"), layout: &self.layout_lens_mist,

@@ -5,6 +5,11 @@ const PAN_SPEED_TILES_PER_SEC: f32 = 12.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 8.0;
 
+/// Piso do ambiente (World Light) em percentual. OTClient não tem piso no
+/// "Ambient Light" (default 0) — com luz global 0 fica preto puro; aqui
+/// mantemos 8% só para o editor não virar abismo no slider 0.
+const MIN_AMBIENT_PCT: u8 = 8;
+
 /// Bounding box dos tiles com chão no andar informado (para a câmera).
 fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16)> {
     let mut min_x = u16::MAX;
@@ -573,7 +578,7 @@ impl<'a> EditorTabViewer<'a> {
                 viewport_size: [scene_width as f32, scene_height as f32],
                 floor_alpha: 1.0,
                 sampling_mode: 0,
-                light: if self.state.world_light < 15 { 15 } else { self.state.world_light } as f32 / 100.0,
+                light: if self.state.world_light < MIN_AMBIENT_PCT { MIN_AMBIENT_PCT } else { self.state.world_light } as f32 / 100.0,
                 _pad_light: 0,
             };
             if let (Some(resources), Some(atlas), Some(scene), Some(output), Some(scaler)) = (
@@ -591,7 +596,7 @@ impl<'a> EditorTabViewer<'a> {
                 // O resultado "iluminado" fica num alvo próprio (`light_target`)
                 // para não ter feedback de leitura/escrita no mesmo alvo.
                 let base_scene: &editor_render::offscreen::SceneTarget = if lights_active {
-                    let ambient = if self.state.world_light < 15 { 15 } else { self.state.world_light } as f32 / 100.0;
+                    let ambient = if self.state.world_light < MIN_AMBIENT_PCT { MIN_AMBIENT_PCT } else { self.state.world_light } as f32 / 100.0;
                     let ox = camera.offset[0];
                     let oy = camera.offset[1];
                     let vw = camera.viewport_size[0];
@@ -656,16 +661,16 @@ impl<'a> EditorTabViewer<'a> {
                     if let Some(post) = &self.state.post_target {
                         let post_size = (output.width, output.height);
                         if self.state.shaders.lens_mist {
-                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, self.state.shaders.lens_mist_strength);
+                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, self.state.shaders.lens_mist_strength, self.state.world_light);
                             if self.state.shaders.crt_bloom {
-                                scaler.post_bloom(device, queue, post_size, &post.view, &output.view, self.state.shaders.crt_bloom_strength);
+                                scaler.post_bloom(device, queue, post_size, &post.view, &output.view, self.state.shaders.crt_bloom_strength, self.state.world_light);
                             } else if self.state.shaders.crt_color {
                                 scaler.post_color(device, queue, &post.view, &output.view);
                             } else {
                                 scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
                             }
                         } else if self.state.shaders.crt_bloom {
-                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view, self.state.shaders.crt_bloom_strength);
+                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view, self.state.shaders.crt_bloom_strength, self.state.world_light);
                             if self.state.shaders.crt_color {
                                 scaler.post_color(device, queue, &post.view, &output.view);
                             } else {
@@ -819,7 +824,7 @@ fn ui_world(&mut self, ui: &mut Ui) {
         ui.checkbox(&mut self.state.shaders.checkerboard_dither, "Checkerboard Dithering (MDAPT)")
             .on_hover_text("Merge Dithering and Pseudo Transparency (MDAPT, Sp00kyFox): funde os padrões de dithering/transparência antes do upscaling, quando a cena está em 1x.");
         ui.checkbox(&mut self.state.shaders.lens_mist, "Lens Mist (névoa)")
-            .on_hover_text("Névoa difusa de lente (veiling glare) sobre a cena final. mix com o próprio blur: não clareia a noite, só amacia as bordas de brilho como uma lente com mist.");
+            .on_hover_text("Névoa difusa de lente (veiling glare) sobre a cena final, ativa só com World Light abaixo de 50% (noite): o raio espalha conforme escurece. mix com o próprio blur: não clareia a noite, só amacia as bordas de brilho.");
         if self.state.shaders.lens_mist {
             ui.add(egui::Slider::new(&mut self.state.shaders.lens_mist_strength, 0.0..=0.25)
                 .text("Lens Mist strength"));
@@ -827,7 +832,7 @@ fn ui_world(&mut self, ui: &mut Ui) {
         ui.checkbox(&mut self.state.shaders.crt_color, "CRT Colour (Rec.601)")
             .on_hover_text("Gama de fósforo SMPTE-C/Rec.601 (P22 dos CRTs de consumo, grade.glsl/Dogway): vermelho fica levemente dessaturado e esquenta pro laranja, azul puxa pro ciano, branco preservado — sem boost de saturação.");
         ui.checkbox(&mut self.state.shaders.crt_bloom, "CRT Bloom")
-            .on_hover_text("Halation de fósforo sobre a cena final, sem scanlines; desacoplado do World Light e com screen blend: pretos recebem bleed fino, brancos ficam intactos (não lava o dia).");
+            .on_hover_text("Halation de fósforo sobre a cena final, sem scanlines; ativa só com World Light acima de 50% (dia), com raio apertando conforme clareia. Screen blend: pretos recebem bleed fino, brancos ficam intactos (não lava o dia).");
         if self.state.shaders.crt_bloom {
             ui.add(egui::Slider::new(&mut self.state.shaders.crt_bloom_strength, 0.0..=0.4)
                 .text("CRT Bloom strength"));

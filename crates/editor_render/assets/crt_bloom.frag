@@ -1,14 +1,16 @@
 #version 450
 // CRT phosphor halation (rework): halo cromatico de fosforo sobre a cena
-// FINAL ja iluminada — desacoplado do World Light. Sem recuperacao de brilho
-// (invWl) e sem boost de noite: a forca e constante e ajustavel (Params.x);
-// raio por canal com escala (Params.y).
+// FINAL ja iluminada. Sem recuperacao de brilho (invWl) e sem boost de noite.
+// Ativo somente de dia (World Light > 50%): Params.x = forca via slider; o raio
+// por canal (Params.y) aperta progressivamente conforme a luz chega em 100%
+// (pegada de monitor CRT em cena clara).
 //
 // FISICA DO CRT:
 //  * raio / espalhamento por canal: azul espalha mais (450nm) -> R4 / G6 / B8.5;
 //  * halos amostram a cena final (o lampiao ja vem totalmente aceso pelo
 //    light buffer — nao multiplicamos rescate de brilho);
-//  * gate por luminancia do HALO: so ha bleed onde ha vizinhos brilhantes;
+//  * gate por luminancia QUENTE do HALO: cores quentes halate mais (foco
+//    CRT quente), azul quase nao gera bleed;
 //  * composicao SCREEN (1-(1-base)(1-glow)): nunca passa de 1.0;
 //    pretos recebem bleed fino do vizinho claro; brancos ficam intactos
 //    (nao lava a cena clara do dia).
@@ -17,7 +19,8 @@ layout(set=0, binding=0) uniform texture2D SrcTex;
 layout(set=0, binding=1) uniform sampler SrcSampler;
 layout(set=0, binding=2) uniform Uniforms {
 	vec2 TextureSize;
-	vec2 Params; // x = strength (0..~0.4 via slider), y = radius scale (1.0)
+	vec2 Params; // x = strength via slider; y = escala de raio (driver pelo
+	             // World Light: aperta perto de 100%, 0 abaixo de 50%)
 } uniforms;
 layout(location=0) out vec4 FragColor;
 
@@ -67,14 +70,16 @@ void main()
 	}
 	halo = halo / max(haloW, 1e-4);
 
-	// Gate por luminancia do halo: somente regioes com vizinhos brilhantes
-	// geram bleed (cena de dia muito clara nao halate por tudo).
+	// Gate por luminancia QUENTE do halo: o bleed é focado nas cores quentes
+	// (vermelho/alaranjado halate muito, azul quase nada) — a pegada de
+	// "monitor CRT quente"; regiões frias não ganham bleed por tudo.
+	float warm = dot(halo, vec3(0.45, 0.35, 0.20));
 	float energy = smoothstep(RME_GLOW_THRESH - RME_GLOW_SOFT,
-		RME_GLOW_THRESH + RME_GLOW_SOFT,
-		max(halo.r, max(halo.g, halo.b)));
+		RME_GLOW_THRESH + RME_GLOW_SOFT, warm);
 
 	float strength = clamp(uniforms.Params.x, 0.0, 0.5);
 	vec3 glow = halo * energy * strength;
+	glow *= vec3(1.15, 1.0, 0.85); // leve viés quente no bleed
 
 	// Screen blend: noite = bleed fino sobre escuro (sem estourar); dia =
 	// brancos intactos (nao lava a cena).
