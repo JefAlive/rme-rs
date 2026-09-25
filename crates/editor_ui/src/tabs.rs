@@ -16,6 +16,96 @@ const LENS_MIST_STRENGTH: f32 = 0.250;
 /// Força fixa do halation de fósforo do CRT Bloom (sem slider), de dia.
 const CRT_BLOOM_STRENGTH: f32 = 0.200;
 
+/// Flicker de luzes por classe de tamanho/cor:
+/// - QUENTE (vermelho dominante) pequeno/médio: oscilação caótica, com
+///   frequências em razões por φ (nunca repetem o padrão). Força empuxa
+///   para as luzes pequenas (some nas grandes). Tem pop/hard edge ocasionais.
+/// - FRIO pequeno: flicker RÍTMICO em 0.6Hz, raio bem pequeno (cristais/etc).
+/// - GRANDE (qualquer cor): leve respiração ~0.024Hz, quase imperceptível.
+const FIRE_WARM_SLOW: f32 = 0.015;
+const FIRE_WARM_MID: f32 = 0.035;
+const FIRE_WARM_FAST: f32 = 0.050;
+const FIRE_POP_AMP: f32 = 0.045;
+const FIRE_COLD_AMP: f32 = 0.040;
+const FIRE_COLD_RADIUS: f32 = 0.020;
+const FIRE_BIG_BREATH: f32 = 0.020;
+const FIRE_BIG_RADIUS: f32 = 0.015;
+const FIRE_WARM_RADIUS: f32 = 0.012;
+
+/// Smoothstep 0→1 entre `e0` e `e1`, clamado.
+fn smoothstep01(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Aplica os três regimes de flicker conforme cor/tamanho da luz. Ajusta
+/// color (brilho) e intensity (raio) por frame, determinístico por posição;
+/// nunca apaga a luz. Retorna inalterada se não pertence a nenhuma classe.
+fn flicker_light(mut light: editor_render::scene::TileLight, t: f32) -> editor_render::scene::TileLight {
+    let r = light.color[0];
+    let g = light.color[1];
+    let b = light.color[2];
+    let warm = r > g && r >= b;
+    let size = light.intensity;
+
+    // Faixa de flicker: pequenas (≤2.5) têm força 1; médias (até ~7) vão
+    // sumindo (empurra para as pequenas); grandes (7.5–10.5 sobem p/ 1) viram
+    // respiração quase imperceptível.
+    let smallness = 1.0 - smoothstep01(2.5, 7.0, size);
+    let largeness = smoothstep01(7.5, 10.5, size);
+    if smallness <= 0.0 && largeness <= 0.0 {
+        return light;
+    }
+
+    let tx = light.world_pos[0].floor();
+    let ty = light.world_pos[1].floor();
+    // Seed 0..1 derivado da posição (luzes próximas "desencronizam").
+    let h = (f32::sin(tx * 12.9898 + ty * 78.233) * 43758.545).fract();
+    let tau = std::f32::consts::TAU;
+    let phi = 1.618_034;
+
+    // Frequências base w e potências de φ (razões irracionais → batimentos
+    // que nunca repetem; "chocam" em vez de marcar o ritmo).
+    let w = 1.9;
+    let s1 = f32::sin(t * w * phi + h * tau);                       // ~0.49 Hz
+    let s2 = f32::sin(t * w + h * tau * 1.43);                      // ~0.30 Hz (razão ~φ)
+    let slow = 0.5 * s1 + 0.5 * s2;                                 // batimento irregular
+    let s3 = f32::sin(t * w * phi * phi + h * tau * 2.37 + 1.4 * s1);        // ~1.28 Hz
+    let s4 = f32::sin(t * w * phi * phi * phi + h * tau * 3.13 + 2.1 * s3);  // ~3.28 Hz
+
+    // Hard edges ocasionais: valor quantizado por célula (~4.5Hz), muda de
+    // salto e é diferente em cada chama.
+    let cell = (t * 4.5).floor();
+    let r0 = (f32::sin(cell * 1.7 + h * 91.7) * 43758.545).fract();
+    let pop = r0 - 0.5;
+
+    let mut d = 0.0;
+    let mut rf = 1.0;
+    if warm {
+        let warm_w = smallness;
+        d += warm_w * (FIRE_WARM_SLOW * slow + FIRE_WARM_MID * s3 + FIRE_WARM_FAST * s4 + FIRE_POP_AMP * pop);
+        rf += warm_w * FIRE_WARM_RADIUS * (0.6 * s3 + 0.4 * s4);
+    } else {
+        // Frio pequeno: rítmico 0.6Hz, amplitude/raio pequenos.
+        let cold_w = smallness;
+        let rhythm = f32::sin(t * 2.0 * std::f32::consts::PI * 0.6 + h * tau);
+        d += cold_w * FIRE_COLD_AMP * rhythm;
+        rf += cold_w * FIRE_COLD_RADIUS * rhythm;
+    }
+    // Grande (qualquer cor): respiração extremamente lenta (~0.024Hz).
+    let big_w = largeness;
+    let breath = f32::sin(t * 0.15 + h * tau);
+    d += big_w * FIRE_BIG_BREATH * breath;
+    rf += big_w * FIRE_BIG_RADIUS * breath;
+
+    let mult = (1.0 + d).max(0.5);
+    for c in light.color.iter_mut() {
+        *c = (*c * mult).min(1.0);
+    }
+    light.intensity = (light.intensity * rf.max(0.5)).max(0.5);
+    light
+}
+
 /// Bounding box dos tiles com chão no andar informado (para a câmera).
 fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16)> {
     let mut min_x = u16::MAX;
@@ -609,12 +699,13 @@ impl<'a> EditorTabViewer<'a> {
                     let min_ty = oy / 32.0 - margin;
                     let max_ty = (oy + vh / zy) / 32.0 + margin;
                     let mut visible_lights: Vec<editor_render::scene::TileLight> = Vec::new();
+                    let flicker_t = ui.input(|i| i.time) as f32;
                     for layer in &layers {
                         for light in self.state.chunk_cache.lights(layer.z) {
                             if light.intensity > 0.0
                                 && light.world_pos[0] >= min_tx && light.world_pos[0] <= max_tx
                                 && light.world_pos[1] >= min_ty && light.world_pos[1] <= max_ty {
-                                visible_lights.push(*light);
+                                visible_lights.push(flicker_light(*light, flicker_t));
                             }
                         }
                     }
