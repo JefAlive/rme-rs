@@ -42,17 +42,35 @@ struct Super2xSaiUniform {
     _padding: [f32; 2],
 }
 
+/// Uniform dos shaders MDAPT e CRT bloom: só o tamanho da textura de origem
+/// (bloco std140 `vec2 TextureSize; vec2 _unused;` = 16 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TexSizeUniform {
+    texture_size: [f32; 2],
+    _padding: [f32; 2],
+}
+
 pub struct ScaleResources {
     pipeline_plain: wgpu::RenderPipeline,
     pipeline_xbrz: wgpu::RenderPipeline,
     pipeline_super_2xsai: wgpu::RenderPipeline,
+    pipeline_mdapt: [wgpu::RenderPipeline; 5],
+    pipeline_crt_color: wgpu::RenderPipeline,
+    pipeline_crt_bloom: wgpu::RenderPipeline,
     layout_plain: wgpu::BindGroupLayout,
     layout_xbrz: wgpu::BindGroupLayout,
     layout_super_2xsai: wgpu::BindGroupLayout,
+    layout_mdapt: wgpu::BindGroupLayout,
+    layout_mdapt_dual: wgpu::BindGroupLayout,
+    layout_crt_color: wgpu::BindGroupLayout,
+    layout_crt_bloom: wgpu::BindGroupLayout,
     uniform_plain: wgpu::Buffer,
     uniform_xbrz: wgpu::Buffer,
     uniform_super_2xsai: wgpu::Buffer,
+    uniform_tex_size: wgpu::Buffer,
     sampler: wgpu::Sampler,
+    sampler_linear: wgpu::Sampler,
 }
 
 impl ScaleResources {
@@ -77,6 +95,16 @@ impl ScaleResources {
         // separados, uniforms em bloco std140).
         let xbrz_fragment = Self::glsl_shader(device, "xbrz", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/xbrz.frag"));
         let sai_fragment = Self::glsl_shader(device, "super2xsai", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/super_2xsai.frag"));
+        // "Shaders" da aba: MDAPT (checkerboard dithering, 5 passadas) roda na
+        // cena nativa antes do upscaling; CRT colour (P22) e CRT bloom rodam
+        // depois, na imagem final. Todos compilados pelo frontend GLSL do naga.
+        let mdapt0_fragment = Self::glsl_shader(device, "mdapt0", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt0.frag"));
+        let mdapt1_fragment = Self::glsl_shader(device, "mdapt1", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt1.frag"));
+        let mdapt2_fragment = Self::glsl_shader(device, "mdapt2", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt2.frag"));
+        let mdapt3_fragment = Self::glsl_shader(device, "mdapt3", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt3.frag"));
+        let mdapt4_fragment = Self::glsl_shader(device, "mdapt4", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt4.frag"));
+        let crt_color_fragment = Self::glsl_shader(device, "crt_color", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_color.frag"));
+        let crt_bloom_fragment = Self::glsl_shader(device, "crt_bloom", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_bloom.frag"));
 
         let layout_plain = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene_scaler_bgl"),
@@ -109,6 +137,14 @@ impl ScaleResources {
         // porque o bloco tem tamanho diferente (xBRZ 16, 2xSaI 24 bytes).
         let layout_xbrz = Self::glsl_layout(device, "scene_scaler_glsl_xbrz_bgl", std::mem::size_of::<XbrzUniform>() as u64);
         let layout_super_2xsai = Self::glsl_layout(device, "scene_scaler_glsl_2xsai_bgl", std::mem::size_of::<Super2xSaiUniform>() as u64);
+        // MDAPT (1 textura) e pós MRAPT (1 textura + 1 alvo).
+        let layout_mdapt = Self::glsl_layout(device, "scene_scaler_mdapt_bgl", std::mem::size_of::<TexSizeUniform>() as u64);
+        // MDAPT passos 3/4: duas texturas (Source + Original) + sampler cada.
+        let layout_mdapt_dual = Self::glsl_layout_dual(device, "scene_scaler_mdapt_dual_bgl", std::mem::size_of::<TexSizeUniform>() as u64);
+        // Pós na imagem final: amostragem linear (window do libretro usa GL
+        // linear no bloom; o CRT colour é um shift por texel, tanto faz).
+        let layout_crt_color = Self::glsl_layout_filter(device, "scene_scaler_crt_color_bgl", None);
+        let layout_crt_bloom = Self::glsl_layout_filter(device, "scene_scaler_crt_bloom_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
 
         let uniform_plain = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene_scaler_uniform"),
@@ -127,6 +163,11 @@ impl ScaleResources {
             contents: bytemuck::bytes_of(&Super2xSaiUniform { texture_size: [1.0, 1.0], output_size: [1.0, 1.0], input_size: [1.0, 1.0], _padding: [0.0; 2] }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let uniform_tex_size = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene_scaler_tex_size_uniform"),
+            contents: bytemuck::bytes_of(&TexSizeUniform { texture_size: [1.0, 1.0], _padding: [0.0; 2] }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
 
         // Nearest: a cena composta tem a densidade do pixel-art; o 2xSaI amos-
         // tra com coordenadas deslocadas, mas quer o texel mais próximo.
@@ -141,11 +182,34 @@ impl ScaleResources {
             ..Default::default()
         });
 
+        // Linear para o halo do CRT bloom (radios fracionárias em texel, sem
+        // aliasy em "leque"). O sampler precisa de texture filterable (o layout
+        // correspondente é criado com filterable: true).
+        let sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("scene_scaler_linear_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         let pipeline_plain = Self::pipeline(device, "scene_scaler_pipeline", &layout_plain, &vertex_module, "vs_main", &plain_fragment, "fs_main");
         let pipeline_xbrz = Self::pipeline(device, "scene_scaler_xbrz", &layout_xbrz, &glsl_vertex, "main", &xbrz_fragment, "main");
         let pipeline_super_2xsai = Self::pipeline(device, "scene_scaler_2xsai", &layout_super_2xsai, &glsl_vertex, "main", &sai_fragment, "main");
+        let pipeline_mdapt = [
+            Self::pipeline(device, "scene_scaler_mdapt0", &layout_mdapt, &glsl_vertex, "main", &mdapt0_fragment, "main"),
+            Self::pipeline(device, "scene_scaler_mdapt1", &layout_mdapt, &glsl_vertex, "main", &mdapt1_fragment, "main"),
+            Self::pipeline(device, "scene_scaler_mdapt2", &layout_mdapt, &glsl_vertex, "main", &mdapt2_fragment, "main"),
+            Self::pipeline(device, "scene_scaler_mdapt3", &layout_mdapt_dual, &glsl_vertex, "main", &mdapt3_fragment, "main"),
+            Self::pipeline(device, "scene_scaler_mdapt4", &layout_mdapt_dual, &glsl_vertex, "main", &mdapt4_fragment, "main"),
+        ];
+        let pipeline_crt_color = Self::pipeline(device, "scene_scaler_crt_color", &layout_crt_color, &glsl_vertex, "main", &crt_color_fragment, "main");
+        let pipeline_crt_bloom = Self::pipeline(device, "scene_scaler_crt_bloom", &layout_crt_bloom, &glsl_vertex, "main", &crt_bloom_fragment, "main");
 
-        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, layout_plain, layout_xbrz, layout_super_2xsai, uniform_plain, uniform_xbrz, uniform_super_2xsai, sampler }
+        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear }
     }
 
     fn glsl_layout(device: &wgpu::Device, label: &'static str, uniform_min_size: u64) -> wgpu::BindGroupLayout {
@@ -180,6 +244,94 @@ impl ScaleResources {
                 },
             ],
         })
+    }
+
+    /// Layout dos passos MDAPT 3/4, que leem Source + Original (2 texturas,
+    /// cada uma com seu sampler) + bloco de uniforms.
+    fn glsl_layout_dual(device: &wgpu::Device, label: &'static str, uniform_min_size: u64) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(label),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(uniform_min_size),
+                    },
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    /// Layout dos pós na imagem final: textura filterable + sampler Filtering
+    /// (o halo do bloom amostra em offsets fracionários) + uniform opcional.
+    fn glsl_layout_filter(device: &wgpu::Device, label: &'static str, uniform_min_size: Option<u64>) -> wgpu::BindGroupLayout {
+        let mut entries = vec![
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ];
+        if let Some(min_size) = uniform_min_size {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(min_size),
+                },
+                count: None,
+            });
+        }
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries: &entries })
     }
 
     fn glsl_shader(device: &wgpu::Device, label: &'static str, stage: wgpu::naga::ShaderStage, source: &'static str) -> wgpu::ShaderModule {
@@ -290,6 +442,116 @@ impl ScaleResources {
             ],
         });
         self.encode_draw(device, queue, &self.pipeline_plain, &bind_group, &target.view, "scene_scaler_blit_pass");
+    }
+
+    /// MDAPT (checkerboard dithering, Sp00kyFox) aplicado na cena nativa antes
+    /// do upscaling, como no composite do RME de referência. Cinco passadas em
+    /// um único encoder; o resultado final fica em `t[0]`. `scene` não muda
+    /// (é a "Original" dos passos 3/4).
+    pub fn render_mdapt(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &SceneTarget, t: [&SceneTarget; 4]) {
+        queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
+            texture_size: [scene.width as f32, scene.height as f32],
+            _padding: [0.0; 2],
+        }));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene_scaler_mdapt_pass") });
+
+        let bg0 = self.mdapt_bg(device, scene);
+        self.draw_pass(&mut encoder, &self.pipeline_mdapt[0], &bg0, &t[0].view, "scene_scaler_mdapt_pass0");
+        let bg1 = self.mdapt_bg(device, t[0]);
+        self.draw_pass(&mut encoder, &self.pipeline_mdapt[1], &bg1, &t[1].view, "scene_scaler_mdapt_pass1");
+        let bg2 = self.mdapt_bg(device, t[1]);
+        self.draw_pass(&mut encoder, &self.pipeline_mdapt[2], &bg2, &t[2].view, "scene_scaler_mdapt_pass2");
+        let bg3 = self.mdapt_dual_bg(device, t[2], scene);
+        self.draw_pass(&mut encoder, &self.pipeline_mdapt[3], &bg3, &t[3].view, "scene_scaler_mdapt_pass3");
+        let bg4 = self.mdapt_dual_bg(device, t[3], scene);
+        self.draw_pass(&mut encoder, &self.pipeline_mdapt[4], &bg4, &t[0].view, "scene_scaler_mdapt_pass4");
+
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// CRT bloom (halo de fósforo, sem scanlines) aplicado na imagem final já
+    /// upscaled. Amostra com o sampler linear (offsets de halo fracionários).
+    pub fn post_bloom(&self, device: &wgpu::Device, queue: &wgpu::Queue, source_size: (u32, u32), source: &wgpu::TextureView, target: &wgpu::TextureView) {
+        queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
+            texture_size: [source_size.0 as f32, source_size.1 as f32],
+            _padding: [0.0; 2],
+        }));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_bloom_bg"), layout: &self.layout_crt_bloom,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.uniform_tex_size.as_entire_binding() },
+            ],
+        });
+        self.encode_draw(device, queue, &self.pipeline_crt_bloom, &bind_group, target, "scene_scaler_bloom_pass");
+    }
+
+    /// CRT colour: fosforo P22 (NTSC D65) aplicado fielmente à imagem final.
+    pub fn post_color(&self, device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::TextureView, target: &wgpu::TextureView) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_crt_color_bg"), layout: &self.layout_crt_color,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
+            ],
+        });
+        self.encode_draw(device, queue, &self.pipeline_crt_color, &bind_group, target, "scene_scaler_crt_color_pass");
+    }
+
+    /// Cópia 1:1 nearest de um alvo para outro (pós usam um alvo intermediário;
+    /// o resultado volta ao target de apresentação).
+    pub fn copy_scene(&self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32), source: &wgpu::TextureView, target: &wgpu::TextureView) {
+        queue.write_buffer(&self.uniform_plain, 0, bytemuck::bytes_of(&ScaleUniform {
+            source_size: [size.0, size.1], output_size: [size.0, size.1],
+            source_cell_size: [1.0; 2], output_cell_size: [1.0; 2],
+            mode: 0, _align_padding: 0, _padding: [0; 2],
+        }));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_copy_bg"), layout: &self.layout_plain,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.uniform_plain.as_entire_binding() },
+            ],
+        });
+        self.encode_draw(device, queue, &self.pipeline_plain, &bind_group, target, "scene_scaler_copy_pass");
+    }
+
+    fn mdapt_bg(&self, device: &wgpu::Device, src: &SceneTarget) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_mdapt_bg"), layout: &self.layout_mdapt,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.uniform_tex_size.as_entire_binding() },
+            ],
+        })
+    }
+
+    fn mdapt_dual_bg(&self, device: &wgpu::Device, src: &SceneTarget, original: &SceneTarget) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_mdapt_dual_bg"), layout: &self.layout_mdapt_dual,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src.view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&original.view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: self.uniform_tex_size.as_entire_binding() },
+            ],
+        })
+    }
+
+    fn draw_pass(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup, target: &wgpu::TextureView, label: &'static str) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })], depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     fn encode_draw(&self, device: &wgpu::Device, queue: &wgpu::Queue, pipeline: &wgpu::RenderPipeline, bind_group: &wgpu::BindGroup, target: &wgpu::TextureView, label: &'static str) {

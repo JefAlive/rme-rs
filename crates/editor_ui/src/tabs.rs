@@ -114,6 +114,20 @@ impl AntiAliasing {
     }
 }
 
+/// Seção "Shaders" da aba World (abaixo de Anti-aliasing):
+/// - checkerboard dithering: MDAPT (Sp00kyFox) rodado na cena nativa (1x)
+///   antes do upscaling, para fundir os padrões de transparência do Tibia;
+/// - crt color: gama de fósforo SMPTE-C/Rec.601 aplicada ao RGB final
+///   (vermelho leve-dessaturado pro laranja, azul pro ciano, branco ok);
+/// - crt bloom: halo de fósforo pós-upscaling, sem scanlines, extensão
+///   acompanha o zoom (roda na resolução final do painel).
+#[derive(Default, Clone, Copy)]
+pub struct ShaderOptions {
+    pub checkerboard_dither: bool,
+    pub crt_color: bool,
+    pub crt_bloom: bool,
+}
+
 /// Estado global compartilhado entre abas.
 pub struct AppState {
     pub documents: Vec<MapDocument>,
@@ -137,6 +151,7 @@ pub struct AppState {
     pub show_monsters: bool,
     pub show_zones: bool,
     pub antialiasing: AntiAliasing,
+    pub shaders: ShaderOptions,
 
     pub current_zoom: u32,
     pub current_floor_display: u8,
@@ -148,6 +163,8 @@ pub struct AppState {
     pub offscreen: Option<editor_render::offscreen::OffscreenTarget>,
     pub scene_target: Option<editor_render::offscreen::SceneTarget>,
     pub filter_target: Option<editor_render::offscreen::SceneTarget>,
+    pub mdapt_targets: [Option<editor_render::offscreen::SceneTarget>; 4],
+    pub post_target: Option<editor_render::offscreen::SceneTarget>,
     pub scaler_resources: Option<editor_render::scaler::ScaleResources>,
     pub chunk_cache: editor_render::scene::ChunkGpuCache,
     pub camera_offset: egui::Vec2,
@@ -178,6 +195,7 @@ impl Default for AppState {
             show_monsters: true,
             show_zones: false,
             antialiasing: AntiAliasing::Off,
+            shaders: ShaderOptions::default(),
             current_zoom: 100,
             current_floor_display: editor_core::position::GROUND_FLOOR,
             hover_info: HoverInfo::default(),
@@ -187,6 +205,8 @@ impl Default for AppState {
             offscreen: None,
             scene_target: None,
             filter_target: None,
+            mdapt_targets: [None, None, None, None],
+            post_target: None,
             scaler_resources: None,
             chunk_cache: Default::default(),
             camera_offset: egui::Vec2::ZERO,
@@ -346,6 +366,12 @@ impl<'a> EditorTabViewer<'a> {
                     ),
                 }
             }
+            // Alvo intermediário dos pós (CRT colour / CRT bloom), do mesmo
+            // tamanho do output; o resultado volta ao output ao final.
+            match &mut self.state.post_target {
+                Some(target) => target.resize_if_needed(device, width, height),
+                None => self.state.post_target = Some(editor_render::offscreen::SceneTarget::create(device, width, height)),
+            }
 
             let floor = self.state.current_floor_display;
             let (start_z, end_z, superend_z) = compute_floor_stack(floor);
@@ -491,6 +517,22 @@ impl<'a> EditorTabViewer<'a> {
                 design_zoom[0] * scene_width as f32 / req_w.max(1.0),
                 design_zoom[1] * scene_height as f32 / req_h.max(1.0),
             ];
+
+            // MDAPT (checkerboard dithering) roda antes do upscaling quando a
+            // cena ainda está em 1x (1 texel por pixel do mapa): modos 2/3 em
+            // zoom-in e as vistas 1:1 de zoom-out. Em densidades supersampleadas
+            // (Retro) ele misturaria o interior do texel, então fica off.
+            let native_scene = (scene_zoom[0] - 1.0).abs() < 1e-3 && (scene_zoom[1] - 1.0).abs() < 1e-3;
+            let mdapt_active = self.state.shaders.checkerboard_dither && native_scene;
+            if mdapt_active {
+                for slot in self.state.mdapt_targets.iter_mut() {
+                    match slot {
+                        Some(target) => target.resize_if_needed(device, scene_width, scene_height),
+                        None => *slot = Some(editor_render::offscreen::SceneTarget::create(device, scene_width, scene_height)),
+                    }
+                }
+            }
+
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
                 zoom: scene_zoom,
@@ -508,16 +550,49 @@ impl<'a> EditorTabViewer<'a> {
                     device, queue, resources, &self.state.chunk_cache, atlas,
                     &scene.view, camera, &layers,
                 );
+                // Fonte do scaler é o resultado do MDAPT quando ativo (a cena
+                // nativa serviu de entrada das 5 passadas; t[0] tem o merge).
+                let scale_source: &editor_render::offscreen::SceneTarget = if mdapt_active {
+                    scaler.render_mdapt(device, queue, scene, [
+                        self.state.mdapt_targets[0].as_ref().unwrap(),
+                        self.state.mdapt_targets[1].as_ref().unwrap(),
+                        self.state.mdapt_targets[2].as_ref().unwrap(),
+                        self.state.mdapt_targets[3].as_ref().unwrap(),
+                    ]);
+                    self.state.mdapt_targets[0].as_ref().unwrap()
+                } else {
+                    scene
+                };
                 if let Some(ratio) = up_ratio {
                     if let Some(filter) = &self.state.filter_target {
                         scaler.render_chain(
-                            device, queue, scene, filter, output, mode, ratio, (scene_zoom, [zoom, zoom]),
+                            device, queue, scale_source, filter, output, mode, ratio, (scene_zoom, [zoom, zoom]),
                         );
                     }
                 } else {
                     scaler.render(
-                        device, queue, scene, output, mode, (scene_zoom, [zoom, zoom]),
+                        device, queue, scale_source, output, mode, (scene_zoom, [zoom, zoom]),
                     );
+                }
+
+                // Pós "Shaders" na imagem final: CRT bloom depois do upscaling
+                // (a extensão acompanha o zoom), CRT colour (P22) por último.
+                // O resultado termina sempre no target de apresentação `output`.
+                if self.state.shaders.crt_color || self.state.shaders.crt_bloom {
+                    if let Some(post) = &self.state.post_target {
+                        let post_size = (output.width, output.height);
+                        if self.state.shaders.crt_bloom {
+                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view);
+                            if self.state.shaders.crt_color {
+                                scaler.post_color(device, queue, &post.view, &output.view);
+                            } else {
+                                scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
+                            }
+                        } else if self.state.shaders.crt_color {
+                            scaler.post_color(device, queue, &output.view, &post.view);
+                            scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
+                        }
+                    }
                 }
             }
 
@@ -649,6 +724,15 @@ impl<'a> EditorTabViewer<'a> {
                     ui.selectable_value(&mut self.state.antialiasing, opt, opt.label());
                 }
             });
+
+        ui.separator();
+        ui.label(RichText::new("Shaders").weak());
+        ui.checkbox(&mut self.state.shaders.checkerboard_dither, "Checkerboard Dithering (MDAPT)")
+            .on_hover_text("Merge Dithering and Pseudo Transparency (MDAPT, Sp00kyFox): funde os padrões de dithering/transparência antes do upscaling, quando a cena está em 1x.");
+        ui.checkbox(&mut self.state.shaders.crt_color, "CRT Colour (Rec.601)")
+            .on_hover_text("Gama de fósforo SMPTE-C/Rec.601 (P22 dos CRTs de consumo, grade.glsl/Dogway): vermelho fica levemente dessaturado e esquenta pro laranja, azul puxa pro ciano, branco preservado — sem boost de saturação.");
+        ui.checkbox(&mut self.state.shaders.crt_bloom, "CRT Bloom")
+            .on_hover_text("Halo de fósforo aplicado depois do upscaling, sem scanlines; a extensão do bloom acompanha o zoom e brancos não estouram.");
     }
 
     fn ui_inspector(&mut self, ui: &mut Ui) {
