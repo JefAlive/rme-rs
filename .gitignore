@@ -3,6 +3,7 @@ Cargo.lock
 .tools/
 
 # Reference projects used for AI
+reference-otclient
 reference-assets
 reference-maps
 reference-src

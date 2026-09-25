@@ -59,6 +59,7 @@ pub struct ScaleResources {
     pipeline_mdapt: [wgpu::RenderPipeline; 5],
     pipeline_crt_color: wgpu::RenderPipeline,
     pipeline_crt_bloom: wgpu::RenderPipeline,
+    pipeline_linear_to_srgb: wgpu::RenderPipeline,
     layout_plain: wgpu::BindGroupLayout,
     layout_xbrz: wgpu::BindGroupLayout,
     layout_super_2xsai: wgpu::BindGroupLayout,
@@ -66,6 +67,7 @@ pub struct ScaleResources {
     layout_mdapt_dual: wgpu::BindGroupLayout,
     layout_crt_color: wgpu::BindGroupLayout,
     layout_crt_bloom: wgpu::BindGroupLayout,
+    layout_linear_to_srgb: wgpu::BindGroupLayout,
     uniform_plain: wgpu::Buffer,
     uniform_xbrz: wgpu::Buffer,
     uniform_super_2xsai: wgpu::Buffer,
@@ -106,6 +108,7 @@ impl ScaleResources {
         let mdapt4_fragment = Self::glsl_shader(device, "mdapt4", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt4.frag"));
         let crt_color_fragment = Self::glsl_shader(device, "crt_color", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_color.frag"));
         let crt_bloom_fragment = Self::glsl_shader(device, "crt_bloom", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_bloom.frag"));
+        let linear_to_srgb_fragment = Self::glsl_shader(device, "linear_to_srgb", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/linear_to_srgb.frag"));
 
         let layout_plain = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene_scaler_bgl"),
@@ -146,6 +149,8 @@ impl ScaleResources {
         // linear no bloom; o CRT colour é um shift por texel, tanto faz).
         let layout_crt_color = Self::glsl_layout_filter(device, "scene_scaler_crt_color_bgl", None);
         let layout_crt_bloom = Self::glsl_layout_filter(device, "scene_scaler_crt_bloom_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
+        // Layout para conversão final linear→sRGB: textura + sampler linear, sem uniforms.
+        let layout_linear_to_srgb = Self::glsl_layout_filter(device, "scene_scaler_linear_to_srgb_bgl", None);
 
         let uniform_plain = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("scene_scaler_uniform"),
@@ -209,8 +214,9 @@ impl ScaleResources {
         ];
         let pipeline_crt_color = Self::pipeline(device, "scene_scaler_crt_color", &layout_crt_color, &glsl_vertex, "main", &crt_color_fragment, "main");
         let pipeline_crt_bloom = Self::pipeline(device, "scene_scaler_crt_bloom", &layout_crt_bloom, &glsl_vertex, "main", &crt_bloom_fragment, "main");
+        let pipeline_linear_to_srgb = Self::pipeline(device, "scene_scaler_linear_to_srgb", &layout_linear_to_srgb, &glsl_vertex, "main", &linear_to_srgb_fragment, "main");
 
-        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear }
+        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, pipeline_linear_to_srgb, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, layout_linear_to_srgb, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear }
     }
 
     fn glsl_layout(device: &wgpu::Device, label: &'static str, uniform_min_size: u64) -> wgpu::BindGroupLayout {
@@ -502,6 +508,19 @@ impl ScaleResources {
             ],
         });
         self.encode_draw(device, queue, &self.pipeline_crt_color, &bind_group, target, "scene_scaler_crt_color_pass");
+    }
+
+    /// Conversão final linear → sRGB para apresentação no egui.
+    /// O pipeline roda todo em linear; esta passagem converte para sRGB antes de exibir.
+    pub fn post_srgb(&self, device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::TextureView, target: &wgpu::TextureView) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_linear_to_srgb_bg"), layout: &self.layout_linear_to_srgb,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
+            ],
+        });
+        self.encode_draw(device, queue, &self.pipeline_linear_to_srgb, &bind_group, target, "scene_scaler_linear_to_srgb_pass");
     }
 
     /// Cópia 1:1 nearest de um alvo para outro (pós usam um alvo intermediário;

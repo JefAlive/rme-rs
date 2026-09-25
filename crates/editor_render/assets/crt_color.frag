@@ -8,6 +8,9 @@
 // framework RGB_to_XYZ do autor (RW = branco D65), col = lin * G,
 // G = M_SMPTE * inverse(M_sRGB). Sem saturação extra.
 //
+// Pipeline linear: entrada linear → GAMUT em linear → saída linear.
+// Conversão final linear→sRGB acontece na passagem de apresentação.
+//
 // Efeito nas primarias puras (em linear):
 //  * vermelho (1,0,0) -> (0.94, 0.018, 0):   leve dessaturada e esquenta
 //    pro laranja;
@@ -30,7 +33,6 @@ const mat3 GAMUT = mat3(
 void main()
 {
 	vec4 base = texture(sampler2D(Source, SourceSampler), vUV);
-	vec3 lin = pow(base.rgb, vec3(2.2));
-	vec3 tint = clamp(lin * GAMUT, vec3(0.0), vec3(1.0));
-	FragColor = vec4(pow(tint, vec3(1.0 / 2.2)), base.a);
+	vec3 tint = clamp(base.rgb * GAMUT, vec3(0.0), vec3(1.0));
+	FragColor = vec4(tint, base.a);
 }

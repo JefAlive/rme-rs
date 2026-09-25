@@ -1,4 +1,4 @@
-pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+pub const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 
 /// Cena já composta antes da passagem de escalonamento. Não é registrada no
 /// egui: somente o resultado final é apresentado na interface.
