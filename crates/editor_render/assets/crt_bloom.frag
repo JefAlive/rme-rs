@@ -27,29 +27,23 @@ layout(set=0, binding=2) uniform Uniforms {
 } uniforms;
 layout(location=0) out vec4 FragColor;
 
-#define RME_GLOW_THRESHOLD 0.46
+#define RME_GLOW_THRESHOLD 0.35
 #define RME_GLOW_SOFTNESS 0.38
-#define RME_STRENGTH 0.52
-#define RME_BOOST_DAY 0.35
-#define RME_BOOST_NIGHT 1.10
+#define RME_STRENGTH 0.20
+#define RME_BOOST_DAY 0.25
+#define RME_BOOST_NIGHT 0.55
 #define RME_RADIUS_R 4.0
 #define RME_RADIUS_G 6.0
 #define RME_RADIUS_B 8.5
 #define TAPS 10
-#define RINGS 5
+#define RINGS 3
 
-// Ganhos por canal do halo (G > R > B): verde mais brilhante, azul mais fraco mas largo.
-#define RME_GAIN vec3(1.05, 1.25, 0.90)
+// Ganhos por canal do halo ( agora neutros: R = G = B = 1.0).
+#define RME_GAIN vec3(1.0, 1.0, 1.0)
 
-// Recombinacao de fosforo diagonal-dominante: mantem o matiz de cada halo
-// (cross-talk pequeno), sem neutralizar para branco como a matriz antiga.
-#define RME_P22_R vec3(0.96, 0.07, 0.02)
-#define RME_P22_G vec3(0.05, 0.94, 0.04)
-#define RME_P22_B vec3(0.03, 0.07, 0.95)
-
-// Anéis sucessivos com peso DECRESCENTE (glow com cauda suave, sem anel rigido).
-const float RME_RING[RINGS] = float[RINGS](0.50, 0.85, 1.25, 1.70, 2.20);
-const float RME_RING_W[RINGS] = float[RINGS](1.00, 0.70, 0.44, 0.26, 0.14);
+// Fatores dos anéis: 3 anéis com peso decrescente (cauda suave).
+const float RME_RING[RINGS] = float[RINGS](0.50, 0.85, 1.30);
+const float RME_RING_W[RINGS] = float[RINGS](1.00, 0.60, 0.30);
 
 const vec2 RME_DIR[TAPS] = vec2[TAPS](
 	vec2(1.00, 0.00), vec2(-1.00, 0.00), vec2(0.00, 1.00), vec2(0.00, -1.00), vec2(0.62, 0.62),
@@ -110,8 +104,8 @@ void main()
 	}
 	halo = halo / max(haloW, 1e-4);
 
-	vec3 ph = halo * RME_GAIN;
-	vec3 p22 = mat3(RME_P22_R, RME_P22_G, RME_P22_B) * ph;
+	vec3 ph = halo * RME_GAIN; // ganhos agora neutros (1.0), ph ~= halo
+	vec3 p22 = ph; // sem cross-talk: halo mantém sua cor
 
 	// --- forca ligada ao World Light: menos luz = mais bloom ------------------
 	float boost = mix(RME_BOOST_DAY, RME_BOOST_NIGHT, 1.0 - wl);
