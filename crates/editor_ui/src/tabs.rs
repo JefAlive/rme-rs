@@ -10,6 +10,12 @@ const ZOOM_MAX: f32 = 8.0;
 /// mantemos 8% só para o editor não virar abismo no slider 0.
 const MIN_AMBIENT_PCT: u8 = 8;
 
+/// Força fixa do lens mist (sem slider): névoa de lente à noite.
+const LENS_MIST_STRENGTH: f32 = 0.250;
+
+/// Força fixa do halation de fósforo do CRT Bloom (sem slider), de dia.
+const CRT_BLOOM_STRENGTH: f32 = 0.200;
+
 /// Bounding box dos tiles com chão no andar informado (para a câmera).
 fn compute_map_bounds(map: &SpatialMap, floor: u8) -> Option<(u16, u16, u16, u16)> {
     let mut min_x = u16::MAX;
@@ -119,35 +125,28 @@ impl AntiAliasing {
     }
 }
 
-/// Seção "Shaders" da aba World (abaixo de Anti-aliasing):
+/// Seção "Shaders" da aba World (abaixo de Anti-aliasing). Todos vêm ligados
+/// por padrão:
 /// - checkerboard dithering: MDAPT (Sp00kyFox) rodado na cena nativa (1x)
 ///   antes do upscaling, para fundir os padrões de transparência do Tibia;
-/// - lens mist: névoa difusa de lente (veiling glare) sobre a cena final.
-///   mix com o próprio blur, não clareia a noite — só amacia bordas de brilho;
-/// - crt color: gama de fósforo SMPTE-C/Rec.601 aplicada ao RGB final
-///   (vermelho leve-dessaturado pro laranja, azul pro ciano, branco ok);
-/// - crt bloom: halation de fósforo pós-upscaling, sem scanlines, extensão
-///   acompanha o zoom (roda na resolução final do painel). Força desacoplada
-///   do World Light (screen blend: pretos com bleed fino, brancos intactos).
+/// - crt bloom: CRT Bloom, um único toggle que combina o lens mist (névoa
+///   difusa de lente, ativa de noite — World Light < 50%) e o halation de
+///   fósforo (ativo de dia — World Light > 50%), forças fixas;
+/// - crt colors: gama de fósforo SMPTE-C/Rec.601 aplicada ao RGB final
+///   (vermelho leve-dessaturado pro laranja, azul pro ciano, branco ok).
 #[derive(Clone, Copy)]
 pub struct ShaderOptions {
     pub checkerboard_dither: bool,
-    pub lens_mist: bool,
-    pub lens_mist_strength: f32,
-    pub crt_color: bool,
     pub crt_bloom: bool,
-    pub crt_bloom_strength: f32,
+    pub crt_color: bool,
 }
 
 impl Default for ShaderOptions {
     fn default() -> Self {
         Self {
-            checkerboard_dither: false,
-            lens_mist: false,
-            lens_mist_strength: 0.05,
-            crt_color: false,
-            crt_bloom: false,
-            crt_bloom_strength: 0.08,
+            checkerboard_dither: true,
+            crt_bloom: true,
+            crt_color: true,
         }
     }
 }
@@ -220,7 +219,7 @@ impl Default for AppState {
             show_npcs: true,
             show_monsters: true,
             show_zones: false,
-            antialiasing: AntiAliasing::Off,
+            antialiasing: AntiAliasing::Retro,
             shaders: ShaderOptions::default(),
             current_zoom: 100,
             current_floor_display: editor_core::position::GROUND_FLOOR,
@@ -653,27 +652,20 @@ impl<'a> EditorTabViewer<'a> {
                 }
 
                 // Pós "Shaders" na imagem final (depois do upscaling, extensão acompanha
-                // o zoom): lens mist (névoa) > CRT bloom (halation) > CRT colour
-                // (P22) por último. Ambos os efeitos são desacoplados do World
-                // Light — atuam sobre a cena final já iluminada, sem clarear a
-                // noite nem lavar o dia. O resultado termina sempre em `output`.
-                if self.state.shaders.lens_mist || self.state.shaders.crt_bloom || self.state.shaders.crt_color {
+                // o zoom). O CRT Bloom é um toggle único que combina o lens mist
+                // (névoa de lente, ativa de noite — World Light < 50%) e o
+                // halation de fósforo (ativo de dia — World Light > 50%), com
+                // forças fixas; o CRT Colors (P22) vai por último. Cada passada
+                // se auto-gateia pelo World Light (força 0 = identidade). O
+                // resultado termina sempre em `output`.
+                if self.state.shaders.crt_bloom || self.state.shaders.crt_color {
                     if let Some(post) = &self.state.post_target {
                         let post_size = (output.width, output.height);
-                        if self.state.shaders.lens_mist {
-                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, self.state.shaders.lens_mist_strength, self.state.world_light);
-                            if self.state.shaders.crt_bloom {
-                                scaler.post_bloom(device, queue, post_size, &post.view, &output.view, self.state.shaders.crt_bloom_strength, self.state.world_light);
-                            } else if self.state.shaders.crt_color {
-                                scaler.post_color(device, queue, &post.view, &output.view);
-                            } else {
-                                scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
-                            }
-                        } else if self.state.shaders.crt_bloom {
-                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view, self.state.shaders.crt_bloom_strength, self.state.world_light);
+                        if self.state.shaders.crt_bloom {
+                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, LENS_MIST_STRENGTH, self.state.world_light);
+                            scaler.post_bloom(device, queue, post_size, &post.view, &output.view, CRT_BLOOM_STRENGTH, self.state.world_light);
                             if self.state.shaders.crt_color {
-                                scaler.post_color(device, queue, &post.view, &output.view);
-                            } else {
+                                scaler.post_color(device, queue, &output.view, &post.view);
                                 scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
                             }
                         } else if self.state.shaders.crt_color {
@@ -821,22 +813,12 @@ fn ui_world(&mut self, ui: &mut Ui) {
 
         ui.separator();
         ui.label(RichText::new("Shaders").weak());
-        ui.checkbox(&mut self.state.shaders.checkerboard_dither, "Checkerboard Dithering (MDAPT)")
+        ui.checkbox(&mut self.state.shaders.checkerboard_dither, "Checkerboard Dithering")
             .on_hover_text("Merge Dithering and Pseudo Transparency (MDAPT, Sp00kyFox): funde os padrões de dithering/transparência antes do upscaling, quando a cena está em 1x.");
-        ui.checkbox(&mut self.state.shaders.lens_mist, "Lens Mist (névoa)")
-            .on_hover_text("Névoa difusa de lente (veiling glare) sobre a cena final, ativa só com World Light abaixo de 50% (noite): o raio espalha conforme escurece. mix com o próprio blur: não clareia a noite, só amacia as bordas de brilho.");
-        if self.state.shaders.lens_mist {
-            ui.add(egui::Slider::new(&mut self.state.shaders.lens_mist_strength, 0.0..=0.25)
-                .text("Lens Mist strength"));
-        }
-        ui.checkbox(&mut self.state.shaders.crt_color, "CRT Colour (Rec.601)")
-            .on_hover_text("Gama de fósforo SMPTE-C/Rec.601 (P22 dos CRTs de consumo, grade.glsl/Dogway): vermelho fica levemente dessaturado e esquenta pro laranja, azul puxa pro ciano, branco preservado — sem boost de saturação.");
         ui.checkbox(&mut self.state.shaders.crt_bloom, "CRT Bloom")
-            .on_hover_text("Halation de fósforo sobre a cena final, sem scanlines; ativa só com World Light acima de 50% (dia), com raio apertando conforme clareia. Screen blend: pretos recebem bleed fino, brancos ficam intactos (não lava o dia).");
-        if self.state.shaders.crt_bloom {
-            ui.add(egui::Slider::new(&mut self.state.shaders.crt_bloom_strength, 0.0..=0.4)
-                .text("CRT Bloom strength"));
-        }
+            .on_hover_text("Lens mist (névoa difusa de lente) à noite, com World Light abaixo de 50% (raio espalha conforme escurece, foco em cores frias), e halation de fósforo de dia, acima de 50% (raio aperta conforme clareia, foco em cores quentes). Sem clarear a noite nem lavar o dia.");
+        ui.checkbox(&mut self.state.shaders.crt_color, "CRT Colors")
+            .on_hover_text("Gama de fósforo SMPTE-C/Rec.601 (P22 dos CRTs de consumo, grade.glsl/Dogway): vermelho fica levemente dessaturado e esquenta pro laranja, azul puxa pro ciano, branco preservado — sem boost de saturação.");
     }
 
     fn ui_inspector(&mut self, ui: &mut Ui) {
