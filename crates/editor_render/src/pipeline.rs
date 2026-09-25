@@ -23,7 +23,8 @@ pub struct CameraUniform {
     pub atlas_columns: u32,
     pub viewport_size: [f32; 2],
     pub floor_alpha: f32,
-    pub _pad2: f32,
+    /// 0 nearest, 1 sharp bilinear, 2 Super 2xSaI, 3 xBRZ.
+    pub sampling_mode: u32,
 }
 
 impl TileRenderResources {

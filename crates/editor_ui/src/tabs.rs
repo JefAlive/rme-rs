@@ -1,7 +1,5 @@
 use editor_core::{MapDocument, position::Position, spatial_map::SpatialMap};
 use egui::{RichText, Ui};
-use editor_render::assets::SpriteResolver;
-use editor_render::atlas::SpriteAtlas;
 
 const PAN_SPEED_TILES_PER_SEC: f32 = 12.0;
 const ZOOM_MIN: f32 = 0.1;
@@ -93,15 +91,25 @@ pub enum WindowBrush { Normal, Hatched }
 pub enum BrushShape { Circle, Square }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum AntiAliasing { Off, Retro, CrtBlend, RoundedEdges }
+pub enum AntiAliasing { Off, Retro, Blurry, RoundedEdges }
 
 impl AntiAliasing {
     fn label(self) -> &'static str {
         match self {
             AntiAliasing::Off => "Off",
-            AntiAliasing::Retro => "Retro",
-            AntiAliasing::CrtBlend => "CRT Blend",
-            AntiAliasing::RoundedEdges => "Rounded Edges",
+            AntiAliasing::Retro => "Retro (Sharp Bilinear)",
+            AntiAliasing::Blurry => "Blurry (Super 2xSaI)",
+            AntiAliasing::RoundedEdges => "Rounded Edges (4xBRZ)",
+        }
+    }
+
+    /// Valor consumido diretamente pelo shader de sprites.
+    fn shader_mode(self) -> u32 {
+        match self {
+            AntiAliasing::Off => 0,
+            AntiAliasing::Retro => 1,
+            AntiAliasing::Blurry => 2,
+            AntiAliasing::RoundedEdges => 3,
         }
     }
 }
@@ -138,6 +146,8 @@ pub struct AppState {
     pub wgpu: Option<egui_wgpu::RenderState>,
     pub tile_resources: Option<editor_render::pipeline::TileRenderResources>,
     pub offscreen: Option<editor_render::offscreen::OffscreenTarget>,
+    pub scene_target: Option<editor_render::offscreen::SceneTarget>,
+    pub scaler_resources: Option<editor_render::scaler::ScaleResources>,
     pub chunk_cache: editor_render::scene::ChunkGpuCache,
     pub camera_offset: egui::Vec2,
     pub camera_zoom: f32,
@@ -174,6 +184,8 @@ impl Default for AppState {
             wgpu: None,
             tile_resources: None,
             offscreen: None,
+            scene_target: None,
+            scaler_resources: None,
             chunk_cache: Default::default(),
             camera_offset: egui::Vec2::ZERO,
             camera_zoom: 1.0,
@@ -314,6 +326,9 @@ impl<'a> EditorTabViewer<'a> {
                     );
                 }
             }
+            if self.state.scaler_resources.is_none() {
+                self.state.scaler_resources = Some(editor_render::scaler::ScaleResources::new(device));
+            }
 
             let width = rect.width().max(1.0) as u32;
             let height = rect.height().max(1.0) as u32;
@@ -397,19 +412,42 @@ impl<'a> EditorTabViewer<'a> {
             }
             layers.sort_by_key(|l| if l.z == end_z { 1 } else { 0 });
 
+            // A cena é desenhada primeiro em resolução nativa e só então
+            // escalada. Em zoom-out a textura cresce para preservar os pixels
+            // de origem; o limite de memória reduz a densidade gradualmente
+            // em views excepcionalmente grandes.
+            let requested_w = width as f32 / self.state.camera_zoom;
+            let requested_h = height as f32 / self.state.camera_zoom;
+            let max_dimension = device.limits().max_texture_dimension_2d as f32;
+            let max_pixels = 32.0 * 1024.0 * 1024.0;
+            let density = (max_dimension / requested_w)
+                .min(max_dimension / requested_h)
+                .min((max_pixels / (requested_w * requested_h)).sqrt())
+                .min(1.0);
+            let scene_width = (requested_w * density).ceil().max(1.0) as u32;
+            let scene_height = (requested_h * density).ceil().max(1.0) as u32;
+            match &mut self.state.scene_target {
+                Some(target) => target.resize_if_needed(device, scene_width, scene_height),
+                None => self.state.scene_target = Some(editor_render::offscreen::SceneTarget::create(device, scene_width, scene_height)),
+            }
+
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
-                zoom: self.state.camera_zoom,
+                zoom: density,
                 atlas_columns: 1,
-                viewport_size: [width as f32, height as f32],
+                viewport_size: [scene_width as f32, scene_height as f32],
                 floor_alpha: 1.0,
-                _pad2: 0.0,
+                sampling_mode: 0,
             };
-            if let (Some(resources), Some(atlas)) = (&self.state.tile_resources, &self.state.atlas) {
+            if let (Some(resources), Some(atlas), Some(scene), Some(output), Some(scaler)) = (
+                &self.state.tile_resources, &self.state.atlas, &self.state.scene_target,
+                &self.state.offscreen, &self.state.scaler_resources,
+            ) {
                 editor_render::scene::render_frame(
                     device, queue, resources, &self.state.chunk_cache, atlas,
-                    self.state.offscreen.as_ref().unwrap(), camera, &layers,
+                    &scene.view, camera, &layers,
                 );
+                scaler.render(device, queue, scene, output, self.state.antialiasing.shader_mode(), width as f32 / scene_width as f32);
             }
 
             let id = self.state.offscreen.as_ref().unwrap().id;
@@ -536,7 +574,7 @@ impl<'a> EditorTabViewer<'a> {
         egui::ComboBox::from_id_salt("antialiasing")
             .selected_text(self.state.antialiasing.label())
             .show_ui(ui, |ui| {
-                for opt in [AntiAliasing::Off, AntiAliasing::Retro, AntiAliasing::CrtBlend, AntiAliasing::RoundedEdges] {
+                for opt in [AntiAliasing::Off, AntiAliasing::Retro, AntiAliasing::Blurry, AntiAliasing::RoundedEdges] {
                     ui.selectable_value(&mut self.state.antialiasing, opt, opt.label());
                 }
             });

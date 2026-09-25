@@ -1,7 +1,7 @@
 use ahash::AHashMap;
 use wgpu::util::DeviceExt;
 use editor_core::{position::{ChunkCoord, Position, CHUNK_SIZE}, spatial_map::SpatialMap};
-use crate::{instance::TileInstance, offscreen::OffscreenTarget, pipeline::{CameraUniform, TileRenderResources}};
+use crate::{instance::TileInstance, pipeline::{CameraUniform, TileRenderResources}};
 
 #[derive(Default)]
 pub struct ChunkGpuCache {
@@ -134,7 +134,7 @@ pub fn render_frame(
     resources: &TileRenderResources,
     cache: &ChunkGpuCache,
     atlas: &crate::atlas::SpriteAtlas,
-    target: &OffscreenTarget,
+    target: &wgpu::TextureView,
     base_camera: CameraUniform,
     layers: &[FloorLayer],
 ) {
@@ -153,7 +153,7 @@ pub fn render_frame(
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("viewport_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.view,
+                view: target,
                 resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.05, b: 0.03, a: 1.0 }), store: wgpu::StoreOp::Store },
             })],
