@@ -233,11 +233,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // aplicado depois, sobre o ground e todos os itens já compostos.
     let sampled = nearest_sample(in.layer, in.uv) * in.tint;
 
-    // Método OTClient: multiplicação em espaço LINEAR (fidelidade 1:1 + correção gamma).
-    // Atlas é Rgba8UnormSrgb + TextureSampleType::Float → GPU JÁ lineariza sRGB→linear na amostragem.
-    // NÃO fazer pow(2.2) aqui (seria dupla linearização).
-    // camera.light = max(world_light, 15) / 100 → mínimo 15% (piso OTClient).
-    // 100% = 1.0 (fiel ao sprite), 0% no slider = 15% (clareira lua/estrelas, nunca preto).
-    let lit = sampled.rgb * camera.light;
-    return vec4<f32>(lit, sampled.a * camera.floor_alpha);
+    // A iluminação (método OTClient) entra como uma passada separada: a cena
+    // aqui é sempre composta em linear SEM escurecimento; o pass apply_light
+    // multiplica cena × light buffer (ambiente + luzes de itens) na mesma
+    // resolução nativa. camera.light não é mais usado no fs_main.
+    return vec4<f32>(sampled.rgb, sampled.a * camera.floor_alpha);
 }

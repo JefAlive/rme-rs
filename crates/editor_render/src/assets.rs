@@ -49,6 +49,9 @@ pub struct ItemVisual {
     pub height: u8,
     pub draw_offset: [f32; 2],
     pub elevation: f32,
+    pub has_light: bool,
+    pub light_color: u32,
+    pub light_intensity: u32,
 }
 
 #[derive(Copy, Clone)]
@@ -112,6 +115,12 @@ impl SpriteResolver {
             return ItemVisual::default();
         };
 
+        // Copia os dados da luz para locais (enum) antes de qualquer borrow
+        // mutável de `self` abaixo; `item_type` vive só até aqui.
+        let has_light = item_type.has_light();
+        let light_color = item_type.sprite.light_color;
+        let light_intensity = item_type.sprite.light_intensity;
+
         let (offset_x, offset_y) = item_type.draw_offset();
         let visual = ItemVisual {
             layer_index: 0,
@@ -119,6 +128,9 @@ impl SpriteResolver {
             height: 1,
             draw_offset: [offset_x as f32, offset_y as f32],
             elevation: if item_type.has_elevation { item_type.draw_height() as f32 } else { 0.0 },
+            has_light,
+            light_color,
+            light_intensity,
         };
 
         // Em itens com padrões (paredes, portas, bordas etc.), o RME escolhe
@@ -156,6 +168,9 @@ impl SpriteResolver {
                 layer_index: sprite.base_layer,
                 width: sprite.width,
                 height: sprite.height,
+                has_light,
+                light_color,
+                light_intensity,
                 ..visual
             };
         }
@@ -193,7 +208,7 @@ impl SpriteResolver {
             "sprite resolver: type_id={type_id} sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) size={}x{} base_layer={base_layer}",
             cell.sheet_file, cell.layout, cell.cell_x, cell.cell_y, cell.width, cell.height,
         );
-        ItemVisual { layer_index: base_layer, width: cell.width, height: cell.height, ..visual }
+        ItemVisual { layer_index: base_layer, width: cell.width, height: cell.height, has_light, light_color, light_intensity, ..visual }
     }
 
     fn decode_sprite_cell(&mut self, sprite_id: u32) -> Option<DecodedSpriteCell> {

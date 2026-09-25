@@ -3,9 +3,28 @@ use wgpu::util::DeviceExt;
 use editor_core::{position::{ChunkCoord, Position, CHUNK_SIZE}, spatial_map::SpatialMap};
 use crate::{instance::TileInstance, pipeline::{CameraUniform, TileRenderResources}};
 
+/// Luz por tile (vinda de ItemVisual.has_light). O layout espelha o struct
+/// `LightInstance` do light_vertex.wgsl: vec3 em storage buffer alinha a 16
+/// bytes, então há um pad não usado entre `intensity` e `color`.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TileLight {
+    /// Centro da luz em coordenadas de mundo (tiles). OTClient posiciona a
+    /// fonte no centro do rect do sprite: tile + 0.5.
+    pub world_pos: [f32; 2],
+    /// Intensidade bruta (1..15 típico), usada como raio em tiles e no falloff
+    pub intensity: f32,
+    /// Padding de alinhamento do vec3 abaixo (WGSL storage: align 16)
+    _pad0: f32,
+    /// Cor linear RGB 0..1 (convertida da paleta 6×6×6 do Tibia)
+    pub color: [f32; 3],
+    _pad1: f32,
+}
+
 #[derive(Default)]
 pub struct ChunkGpuCache {
     floors: AHashMap<u8, Option<(wgpu::Buffer, u32)>>,
+    lights: AHashMap<u8, Vec<TileLight>>,
 }
 
 impl ChunkGpuCache {
@@ -45,25 +64,38 @@ impl ChunkGpuCache {
         positions.sort_unstable_by_key(|p| (p.x / 4, p.y / 4, p.x % 4, p.y % 4));
 
         let mut instances = Vec::with_capacity(positions.len() * 2);
+        let mut floor_lights = Vec::new();
         for pos in positions {
             let Some(tile) = map.get_tile(pos) else { continue };
             let mut elevation = 0.0;
             if let Some(ground) = &tile.ground {
                 let visual = resolve_visual(ground.type_id, pos);
+                if visual.has_light {
+                    floor_lights.push(tilelight_from_visual(&visual, pos));
+                }
                 append_visual_instances(&mut instances, pos, visual, elevation);
                 elevation += visual.elevation;
             }
             for item in &tile.items {
                 let visual = resolve_visual(item.type_id, pos);
+                if visual.has_light {
+                    floor_lights.push(tilelight_from_visual(&visual, pos));
+                }
                 append_visual_instances(&mut instances, pos, visual, elevation);
                 elevation += visual.elevation;
             }
         }
 
         self.floors.insert(floor, upload_instances(device, "floor_instances", &instances));
+        self.lights.insert(floor, floor_lights);
         for coord in dirty {
             map.clear_dirty(&coord);
         }
+    }
+
+    /// Retorna as luzes do andar `z` (já filtradas por has_light).
+    pub fn lights(&self, z: u8) -> &[TileLight] {
+        self.lights.get(&z).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Desenha o buffer ordenado tile-a-tile do andar `z`.
@@ -72,6 +104,27 @@ impl ChunkGpuCache {
             pass.set_vertex_buffer(1, buf.slice(..));
             pass.draw(0..4, 0..*count);
         }
+    }
+}
+
+fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position) -> TileLight {
+    // Converte cor 8-bit Tibia (6×6×6) para RGB linear 0..1
+    let color8 = visual.light_color;
+    let (r, g, b) = if color8 == 0 || color8 >= 216 {
+        (0.0, 0.0, 0.0)
+    } else {
+        let r = ((color8 / 36) % 6) as f32 * 51.0 / 255.0;
+        let g = ((color8 / 6) % 6) as f32 * 51.0 / 255.0;
+        let b = (color8 % 6) as f32 * 51.0 / 255.0;
+        (r, g, b)
+    };
+    TileLight {
+        // OTClient usa o centro do rect do sprite (tile * 32 + 16 px) → tile + 0.5
+        world_pos: [pos.x as f32 + 0.5, pos.y as f32 + 0.5],
+        intensity: visual.light_intensity as f32,
+        _pad0: 0.0,
+        color: [r, g, b],
+        _pad1: 0.0,
     }
 }
 

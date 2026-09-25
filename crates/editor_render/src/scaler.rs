@@ -1,5 +1,7 @@
 use wgpu::util::DeviceExt;
 use crate::offscreen::{OFFSCREEN_FORMAT, OffscreenTarget, SceneTarget};
+use crate::pipeline::CameraUniform;
+use crate::scene::TileLight;
 
 /// State das passadas pixel-art do RME de referência.
 pub const MODE_OFF: u32 = 0;
@@ -60,6 +62,8 @@ pub struct ScaleResources {
     pipeline_crt_color: wgpu::RenderPipeline,
     pipeline_crt_bloom: wgpu::RenderPipeline,
     pipeline_linear_to_srgb: wgpu::RenderPipeline,
+    pipeline_lights: wgpu::RenderPipeline,
+    pipeline_apply_light: wgpu::RenderPipeline,
     layout_plain: wgpu::BindGroupLayout,
     layout_xbrz: wgpu::BindGroupLayout,
     layout_super_2xsai: wgpu::BindGroupLayout,
@@ -68,12 +72,23 @@ pub struct ScaleResources {
     layout_crt_color: wgpu::BindGroupLayout,
     layout_crt_bloom: wgpu::BindGroupLayout,
     layout_linear_to_srgb: wgpu::BindGroupLayout,
+    layout_lights: wgpu::BindGroupLayout,
+    layout_apply_light: wgpu::BindGroupLayout,
     uniform_plain: wgpu::Buffer,
     uniform_xbrz: wgpu::Buffer,
     uniform_super_2xsai: wgpu::Buffer,
     uniform_tex_size: wgpu::Buffer,
     sampler: wgpu::Sampler,
     sampler_linear: wgpu::Sampler,
+    /// Buffer de instâncias de luz (storage buffer, atualizado por frame)
+    light_buffer: wgpu::Buffer,
+    light_buffer_capacity: usize,
+    /// Câmera dedicada do pass de luz (CameraUniform de 48 bytes reescrito por frame)
+    light_camera_uniform: wgpu::Buffer,
+    /// Textura do light buffer (Rgba8Unorm linear, resolução nativa da cena)
+    light_texture: wgpu::Texture,
+    light_texture_view: wgpu::TextureView,
+    light_texture_size: (u32, u32),
 }
 
 impl ScaleResources {
@@ -109,6 +124,20 @@ impl ScaleResources {
         let crt_color_fragment = Self::glsl_shader(device, "crt_color", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_color.frag"));
         let crt_bloom_fragment = Self::glsl_shader(device, "crt_bloom", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_bloom.frag"));
         let linear_to_srgb_fragment = Self::glsl_shader(device, "linear_to_srgb", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/linear_to_srgb.frag"));
+        // Shader WGSL da iluminação: light_buffer (quads por fonte, blend Max)
+        // e apply_light (multiplicação cena × light buffer em linear).
+        let light_vertex = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("light_vertex"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../assets/light_vertex.wgsl").into()),
+        });
+        let light_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("light_fragment"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../assets/light_fragment.wgsl").into()),
+        });
+        let apply_light_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("apply_light"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../assets/apply_light.wgsl").into()),
+        });
 
         let layout_plain = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene_scaler_bgl"),
@@ -216,7 +245,183 @@ impl ScaleResources {
         let pipeline_crt_bloom = Self::pipeline(device, "scene_scaler_crt_bloom", &layout_crt_bloom, &glsl_vertex, "main", &crt_bloom_fragment, "main");
         let pipeline_linear_to_srgb = Self::pipeline(device, "scene_scaler_linear_to_srgb", &layout_linear_to_srgb, &glsl_vertex, "main", &linear_to_srgb_fragment, "main");
 
-        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, pipeline_linear_to_srgb, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, layout_linear_to_srgb, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear }
+        // Layout da iluminação: (0) CameraUniform estático. As fontes de luz
+        // entram como vertex buffer de instância (TileLight) — o backend GL
+        // aqui tem limite 0 de storage buffers por shader.
+        let layout_lights = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene_light_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<CameraUniform>() as u64),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        // pipeline_apply_light: (0) textura da cena, (1) sampler, (2) textura
+        // do light buffer, (3) sampler — fullscreen triangle, sem uniforms.
+        let layout_apply_light = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene_apply_light_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+            ],
+        });
+
+        // pipeline_lights: alvo é o light buffer Rgba8Unorm (linear, sem
+        // codificação sRGB); blend Max por canal soma o máximo das luzes.
+        // Vertex = instância TileLight (TriangleStrip, 4 vértices por fonte).
+        let light_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TileLight>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            // Offsets explícitos: TileLight tem um pad (align 16 do vec3 WGSL)
+            // entre `intensity` (8) e `color` (16). vertex_attr_array empacota
+            // offsets consecutivos e apontaria color para o pad errado.
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 8, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 16, shader_location: 2 },
+            ],
+        };
+        let pipeline_lights_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene_light_pipeline_layout"),
+            bind_group_layouts: &[&layout_lights],
+            push_constant_ranges: &[],
+        });
+        let pipeline_lights = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene_light_pipeline"),
+            layout: Some(&pipeline_lights_layout),
+            vertex: wgpu::VertexState {
+                module: &light_vertex,
+                entry_point: "vs_main",
+                buffers: &[light_layout],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &light_fragment,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Max,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Max,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // pipeline_apply_light: multiplica cena × light buffer (mesma resolução).
+        let apply_light_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scene_apply_light_pipeline_layout"),
+            bind_group_layouts: &[&layout_apply_light],
+            push_constant_ranges: &[],
+        });
+        let pipeline_apply_light = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene_apply_light_pipeline"),
+            layout: Some(&apply_light_layout),
+            vertex: wgpu::VertexState {
+                module: &apply_light_module,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &apply_light_module,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: OFFSCREEN_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Buffers e textura da iluminação. O vertex buffer de instâncias cresce
+        // conforme a cena visível (capacidade em nº de luzes).
+        let light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scene_light_buffer"),
+            size: (64 * std::mem::size_of::<TileLight>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_camera_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scene_light_camera_uniform"),
+            contents: bytemuck::bytes_of(&CameraUniform {
+                offset: [0.0; 2], zoom: [1.0; 2], atlas_columns: 1, _align_pad: 0,
+                viewport_size: [1.0, 1.0], floor_alpha: 1.0, sampling_mode: 0,
+                light: 1.0, _pad_light: 0,
+            }),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let light_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene_light_texture"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let light_texture_view = light_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, pipeline_linear_to_srgb, pipeline_lights, pipeline_apply_light, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, layout_linear_to_srgb, layout_lights, layout_apply_light, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear, light_buffer, light_buffer_capacity: 64, light_camera_uniform, light_texture, light_texture_view, light_texture_size: (1, 1) }
     }
 
     fn glsl_layout(device: &wgpu::Device, label: &'static str, uniform_min_size: u64) -> wgpu::BindGroupLayout {
@@ -521,6 +726,94 @@ impl ScaleResources {
             ],
         });
         self.encode_draw(device, queue, &self.pipeline_linear_to_srgb, &bind_group, target, "scene_scaler_linear_to_srgb_pass");
+    }
+
+    /// Pass de luz (método OTClient, adaptado para quads por fonte): limpa o
+    /// light buffer com a cor ambiente e desenha cada fonte como um quad de
+    /// raio `intensity` tiles com falloff linear (lightview.cpp:updatePixels),
+    /// composto por máximo por canal (blend Max). O alvo é Rgba8Unorm linear
+    /// na resolução nativa da cena. `ambient` é a cor ambiente 0..1 (piso 15%).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_lights(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, camera: &CameraUniform, lights: &[TileLight], scene_size: (u32, u32), ambient: [f32; 3]) {
+        // Garante textura do light buffer no tamanho da cena nativa.
+        if self.light_texture_size != scene_size {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("scene_light_texture"),
+                size: wgpu::Extent3d { width: scene_size.0.max(1), height: scene_size.1.max(1), depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            self.light_texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.light_texture = texture;
+            self.light_texture_size = scene_size;
+        }
+
+        // Cresce o vertex buffer de instâncias conforme o nº de luzes visíveis.
+        let byte_len = std::mem::size_of_val(lights);
+        if lights.len() > self.light_buffer_capacity {
+            self.light_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("scene_light_buffer"),
+                size: byte_len.max(64) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.light_buffer_capacity = byte_len.max(64) / std::mem::size_of::<TileLight>();
+        }
+
+        queue.write_buffer(&self.light_camera_uniform, 0, bytemuck::bytes_of(camera));
+        if !lights.is_empty() {
+            queue.write_buffer(&self.light_buffer, 0, bytemuck::cast_slice(lights));
+        }
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_light_bg"), layout: &self.layout_lights,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.light_camera_uniform.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene_light_pass") });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene_light_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.light_texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: ambient[0] as f64, g: ambient[1] as f64, b: ambient[2] as f64, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline_lights);
+            pass.set_bind_group(0, &bind_group, &[]);
+            if !lights.is_empty() {
+                pass.set_vertex_buffer(0, self.light_buffer.slice(..));
+                pass.draw(0..4, 0..lights.len() as u32);
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Multiplica a cena composta pelo light buffer (mesma resolução nativa),
+    /// produzindo a cena iluminada fora do alvo original (sem feedback de
+    /// leitura/escrita no mesmo alvo).
+    pub fn apply_light(&self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &wgpu::TextureView, target: &wgpu::TextureView) {
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_apply_light_bg"), layout: &self.layout_apply_light,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(scene) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.light_texture_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.encode_draw(device, queue, &self.pipeline_apply_light, &bind_group, target, "scene_apply_light_pass");
     }
 
     /// Cópia 1:1 nearest de um alvo para outro (pós usam um alvo intermediário;

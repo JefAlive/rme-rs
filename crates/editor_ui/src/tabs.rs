@@ -165,6 +165,8 @@ pub struct AppState {
     pub filter_target: Option<editor_render::offscreen::SceneTarget>,
     pub mdapt_targets: [Option<editor_render::offscreen::SceneTarget>; 4],
     pub post_target: Option<editor_render::offscreen::SceneTarget>,
+    /// Alvo da cena iluminada (saída do apply_light; input da cena × light buffer)
+    pub light_target: Option<editor_render::offscreen::SceneTarget>,
     pub scaler_resources: Option<editor_render::scaler::ScaleResources>,
     pub chunk_cache: editor_render::scene::ChunkGpuCache,
     pub camera_offset: egui::Vec2,
@@ -207,6 +209,7 @@ impl Default for AppState {
             filter_target: None,
             mdapt_targets: [None, None, None, None],
             post_target: None,
+            light_target: None,
             scaler_resources: None,
             chunk_cache: Default::default(),
             camera_offset: egui::Vec2::ZERO,
@@ -533,6 +536,16 @@ impl<'a> EditorTabViewer<'a> {
                 }
             }
 
+            // Iluminação (método OTClient): só ativa quando há dimming real
+            // (isDark: < 0.99). Em dia pleno (slider 100) não há pass de luz.
+            let lights_active = (self.state.world_light as f32 / 100.0) < 0.99;
+            if lights_active {
+                match &mut self.state.light_target {
+                    Some(target) => target.resize_if_needed(device, scene_width, scene_height),
+                    None => self.state.light_target = Some(editor_render::offscreen::SceneTarget::create(device, scene_width, scene_height)),
+                }
+            }
+
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
                 zoom: scene_zoom,
@@ -546,16 +559,54 @@ impl<'a> EditorTabViewer<'a> {
             };
             if let (Some(resources), Some(atlas), Some(scene), Some(output), Some(scaler)) = (
                 &self.state.tile_resources, &self.state.atlas, &self.state.scene_target,
-                &self.state.offscreen, &self.state.scaler_resources,
+                &self.state.offscreen, self.state.scaler_resources.as_mut(),
             ) {
                 editor_render::scene::render_frame(
                     device, queue, resources, &self.state.chunk_cache, atlas,
                     &scene.view, camera, &layers,
                 );
+
+                // Pass de luz: light buffer (ambiente + quads das fontes, blend
+                // Max por canal) multiplicado pela cena — mesmo método do
+                // LightView do OTClient, adaptado para quads por fonte na GPU.
+                // O resultado "iluminado" fica num alvo próprio (`light_target`)
+                // para não ter feedback de leitura/escrita no mesmo alvo.
+                let base_scene: &editor_render::offscreen::SceneTarget = if lights_active {
+                    let ambient = if self.state.world_light < 15 { 15 } else { self.state.world_light } as f32 / 100.0;
+                    let ox = camera.offset[0];
+                    let oy = camera.offset[1];
+                    let vw = camera.viewport_size[0];
+                    let vh = camera.viewport_size[1];
+                    let zx = camera.zoom[0];
+                    let zy = camera.zoom[1];
+                    // Corta luzes fora da vista (raio máximo da fonte + folga).
+                    let margin = 32.0;
+                    let min_tx = ox / 32.0 - margin;
+                    let max_tx = (ox + vw / zx) / 32.0 + margin;
+                    let min_ty = oy / 32.0 - margin;
+                    let max_ty = (oy + vh / zy) / 32.0 + margin;
+                    let mut visible_lights: Vec<editor_render::scene::TileLight> = Vec::new();
+                    for layer in &layers {
+                        for light in self.state.chunk_cache.lights(layer.z) {
+                            if light.intensity > 0.0
+                                && light.world_pos[0] >= min_tx && light.world_pos[0] <= max_tx
+                                && light.world_pos[1] >= min_ty && light.world_pos[1] <= max_ty {
+                                visible_lights.push(*light);
+                            }
+                        }
+                    }
+                    scaler.render_lights(device, queue, &camera, &visible_lights, (scene_width, scene_height), [ambient; 3]);
+                    let lit = self.state.light_target.as_ref().unwrap();
+                    scaler.apply_light(device, queue, &scene.view, &lit.view);
+                    lit
+                } else {
+                    scene
+                };
+
                 // Fonte do scaler é o resultado do MDAPT quando ativo (a cena
-                // nativa serviu de entrada das 5 passadas; t[0] tem o merge).
+                // iluminada serviu de entrada das 5 passadas; t[0] tem o merge).
                 let scale_source: &editor_render::offscreen::SceneTarget = if mdapt_active {
-                    scaler.render_mdapt(device, queue, scene, [
+                    scaler.render_mdapt(device, queue, base_scene, [
                         self.state.mdapt_targets[0].as_ref().unwrap(),
                         self.state.mdapt_targets[1].as_ref().unwrap(),
                         self.state.mdapt_targets[2].as_ref().unwrap(),
@@ -563,7 +614,7 @@ impl<'a> EditorTabViewer<'a> {
                     ]);
                     self.state.mdapt_targets[0].as_ref().unwrap()
                 } else {
-                    scene
+                    base_scene
                 };
                 if let Some(ratio) = up_ratio {
                     if let Some(filter) = &self.state.filter_target {
