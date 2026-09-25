@@ -19,8 +19,9 @@ pub struct TileRenderResources {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
     pub offset: [f32; 2],
-    pub zoom: f32,
+    pub zoom: [f32; 2],
     pub atlas_columns: u32,
+    pub _align_pad: u32,
     pub viewport_size: [f32; 2],
     pub floor_alpha: f32,
     /// 0 nearest, 1 sharp bilinear, 2 Super 2xSaI, 3 xBRZ.

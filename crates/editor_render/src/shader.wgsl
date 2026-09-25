@@ -1,7 +1,8 @@
 struct Camera {
     offset: vec2<f32>,
-    zoom: f32,
+    zoom: vec2<f32>,
     atlas_columns: u32,
+    _align_pad: u32,
     viewport_size: vec2<f32>,
     floor_alpha: f32,
     sampling_mode: u32,
@@ -72,8 +73,8 @@ fn sharp_bilinear(layer: u32, uv: vec2<f32>) -> vec4<f32> {
     let texel = uv * TILE_SIZE;
     let cell = floor(texel);
     let fractional = fract(texel);
-    let scale = max(camera.zoom, 1.0);
-    let range = max(0.0, 0.5 - 0.5 / scale);
+    let scale = max(camera.zoom, vec2<f32>(1.0));
+    let range = max(vec2<f32>(0.0), vec2<f32>(0.5) - 0.5 / scale);
     let center = fractional - vec2<f32>(0.5);
     let sharp_fraction = (center - clamp(center, vec2<f32>(-range), vec2<f32>(range))) * scale + vec2<f32>(0.5);
     return bilinear_at(layer, cell + sharp_fraction - vec2<f32>(0.5));
@@ -205,7 +206,7 @@ fn xbrz_4x(layer: u32, uv: vec2<f32>) -> vec4<f32> {
 // Redução por área: em 25% agrega uma grade 4x4 por pixel final, eliminando
 // o alias de escolher um único texel no zoom extremo.
 fn area_downsample(layer: u32, uv: vec2<f32>) -> vec4<f32> {
-    let footprint = min(10.0, 1.0 / max(camera.zoom, 0.1));
+    let footprint = min(10.0, 1.0 / max(min(camera.zoom.x, camera.zoom.y), 0.1));
     let samples = i32(ceil(footprint));
     let begin = uv * TILE_SIZE - vec2<f32>(0.5 + footprint * 0.5);
     var total = vec4<f32>(0.0);

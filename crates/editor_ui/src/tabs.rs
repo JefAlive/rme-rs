@@ -147,6 +147,7 @@ pub struct AppState {
     pub tile_resources: Option<editor_render::pipeline::TileRenderResources>,
     pub offscreen: Option<editor_render::offscreen::OffscreenTarget>,
     pub scene_target: Option<editor_render::offscreen::SceneTarget>,
+    pub filter_target: Option<editor_render::offscreen::SceneTarget>,
     pub scaler_resources: Option<editor_render::scaler::ScaleResources>,
     pub chunk_cache: editor_render::scene::ChunkGpuCache,
     pub camera_offset: egui::Vec2,
@@ -185,6 +186,7 @@ impl Default for AppState {
             tile_resources: None,
             offscreen: None,
             scene_target: None,
+            filter_target: None,
             scaler_resources: None,
             chunk_cache: Default::default(),
             camera_offset: egui::Vec2::ZERO,
@@ -273,12 +275,15 @@ impl<'a> EditorTabViewer<'a> {
 
         // --- Navegação: zoom no scroll (ancorado no cursor), pan WASD, andar Q/E ---
         if resp.hovered() {
-            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
             if scroll_y != 0.0 {
                 if let Some(hover_pos) = ui.input(|i| i.pointer.hover_pos()) {
                     let local = hover_pos - rect.min;
                     let old_zoom = self.state.camera_zoom;
-                    let new_zoom = (old_zoom * (1.0 + scroll_y * 0.001)).clamp(ZOOM_MIN, ZOOM_MAX);
+                    // Um pouco mais sensível abaixo de 200% para navegar o zoom
+                    // com menos giros de scroll; acima disso mantém o passo.
+                    let sensitivity = if old_zoom < 2.0 { 0.0018 } else { 0.001 };
+                    let new_zoom = (old_zoom * (1.0 + scroll_y * sensitivity)).clamp(ZOOM_MIN, ZOOM_MAX);
                     if (new_zoom - old_zoom).abs() > f32::EPSILON {
                         // Mantém o ponto do mundo sob o cursor fixo ao zoomar.
                         self.state.camera_offset.x += local.x * (1.0 / old_zoom - 1.0 / new_zoom);
@@ -412,29 +417,85 @@ impl<'a> EditorTabViewer<'a> {
             }
             layers.sort_by_key(|l| if l.z == end_z { 1 } else { 0 });
 
-            // A cena é desenhada primeiro em resolução nativa e só então
-            // escalada. Em zoom-out a textura cresce para preservar os pixels
-            // de origem; o limite de memória reduz a densidade gradualmente
-            // em views excepcionalmente grandes.
-            let requested_w = width as f32 / self.state.camera_zoom;
-            let requested_h = height as f32 / self.state.camera_zoom;
+            // Tamanho do buffer de cena no estilo do RME de referência: em
+            // zoom-in o Retro (Smooth) supersampleia a cena em densidade
+            // inteira (ceil do zoom, sourceCellSize) para que as bordas dos
+            // tiles fiquem alinhadas e o filtro atue sobre células inteiras.
+            // Os filtros pixel-art (Super 2xSaI, xBRZ) processam a cena nativa
+            // (1 texel por pixel do mapa) e o chain sobe em múltiplos inteiros
+            // (2xSaI 2x, xBRZ 4x) para um alvo intermediário; o blit final
+            // encaixa o resultado no tamanho da janela, mantendo o grid do
+            // filtro inteiro e consistente durante o zoom fracionário. "Off"
+            // mantém o buffer do tamanho do painel. Em zoom-out a cena fica
+            // nativa (até 2x o painel) e o scaler só reduz. O filtro em si é
+            // sempre a última passada, sobre a cena composta inteira.
+            let mode = self.state.antialiasing.shader_mode();
+            let zoom = self.state.camera_zoom;
+            let (req_w, req_h, design_zoom) = if mode == 0 {
+                (width.max(1) as f32, height.max(1) as f32, [zoom, zoom])
+            } else if zoom > 1.0 {
+                if mode >= 2 {
+                    // Super 2xSaI / xBRZ: cena nativa; o filtro sobe a 2x/4x.
+                    ((width.max(1) as f32 / zoom).ceil(),
+                     (height.max(1) as f32 / zoom).ceil(),
+                     [1.0, 1.0])
+                } else {
+                    let density = zoom.ceil();
+                    ((width.max(1) as f32 / zoom).ceil() * density,
+                     (height.max(1) as f32 / zoom).ceil() * density,
+                     [density, density])
+                }
+            } else if zoom >= 0.5 {
+                ((width.max(1) as f32 / zoom).ceil(),
+                 (height.max(1) as f32 / zoom).ceil(),
+                 [1.0, 1.0])
+            } else {
+                (width.max(1) as f32 * 2.0,
+                 height.max(1) as f32 * 2.0,
+                 [zoom * 2.0, zoom * 2.0])
+            };
             let max_dimension = device.limits().max_texture_dimension_2d as f32;
             let max_pixels = 32.0 * 1024.0 * 1024.0;
-            let density = (max_dimension / requested_w)
-                .min(max_dimension / requested_h)
-                .min((max_pixels / (requested_w * requested_h)).sqrt())
+            let cap = (max_dimension / req_w)
+                .min(max_dimension / req_h)
+                .min((max_pixels / (req_w * req_h)).sqrt())
                 .min(1.0);
-            let scene_width = (requested_w * density).ceil().max(1.0) as u32;
-            let scene_height = (requested_h * density).ceil().max(1.0) as u32;
+            let scene_width = (req_w * cap).ceil().max(1.0) as u32;
+            let scene_height = (req_h * cap).ceil().max(1.0) as u32;
             match &mut self.state.scene_target {
                 Some(target) => target.resize_if_needed(device, scene_width, scene_height),
                 None => self.state.scene_target = Some(editor_render::offscreen::SceneTarget::create(device, scene_width, scene_height)),
             }
 
+            // Alvo intermediário do chain pixel-art: filtro em múltiplo
+            // inteiro (2xSaI 2x, xBRZ 4x) antes do blit final para a janela.
+            let up_ratio = if (mode == 2 || mode == 3) && zoom > 1.0 { Some(if mode == 2 { 2 } else { 4 }) } else { None };
+            if let Some(ratio) = up_ratio {
+                let fw = (req_w * ratio as f32).ceil().max(1.0);
+                let fh = (req_h * ratio as f32).ceil().max(1.0);
+                let cap = (max_dimension / fw)
+                    .min(max_dimension / fh)
+                    .min((max_pixels / (fw * fh)).sqrt())
+                    .min(1.0);
+                let filter_width = (fw * cap).ceil().max(1.0) as u32;
+                let filter_height = (fh * cap).ceil().max(1.0) as u32;
+                match &mut self.state.filter_target {
+                    Some(target) => target.resize_if_needed(device, filter_width, filter_height),
+                    None => self.state.filter_target = Some(editor_render::offscreen::SceneTarget::create(device, filter_width, filter_height)),
+                }
+            }
+
+            // Zoom exato por eixo; sem arredondamento a célula do filtro fica
+            // fracionária (ex: 2.001 em vez de 2) e treme durante o zoom.
+            let scene_zoom = [
+                design_zoom[0] * scene_width as f32 / req_w.max(1.0),
+                design_zoom[1] * scene_height as f32 / req_h.max(1.0),
+            ];
             let camera = editor_render::pipeline::CameraUniform {
                 offset: [self.state.camera_offset.x, self.state.camera_offset.y],
-                zoom: density,
+                zoom: scene_zoom,
                 atlas_columns: 1,
+                _align_pad: 0,
                 viewport_size: [scene_width as f32, scene_height as f32],
                 floor_alpha: 1.0,
                 sampling_mode: 0,
@@ -447,7 +508,17 @@ impl<'a> EditorTabViewer<'a> {
                     device, queue, resources, &self.state.chunk_cache, atlas,
                     &scene.view, camera, &layers,
                 );
-                scaler.render(device, queue, scene, output, self.state.antialiasing.shader_mode(), width as f32 / scene_width as f32);
+                if let Some(ratio) = up_ratio {
+                    if let Some(filter) = &self.state.filter_target {
+                        scaler.render_chain(
+                            device, queue, scene, filter, output, mode, ratio, (scene_zoom, [zoom, zoom]),
+                        );
+                    }
+                } else {
+                    scaler.render(
+                        device, queue, scene, output, mode, (scene_zoom, [zoom, zoom]),
+                    );
+                }
             }
 
             let id = self.state.offscreen.as_ref().unwrap().id;

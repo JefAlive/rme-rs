@@ -18,5 +18,5 @@ egui          = "0.29"
 eframe        = "0.29"
 egui_dock     = "0.14"
 egui-wgpu     = "0.29"
-wgpu          = "22"
+wgpu          = { version = "22", features = ["glsl"] }
 bytemuck      = { version = "1.16", features = ["derive"] }
