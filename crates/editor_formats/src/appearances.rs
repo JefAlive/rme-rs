@@ -171,6 +171,12 @@ impl ItemType {
     pub fn has_light(&self) -> bool {
         self.sprite.has_light
     }
+
+    /// Item tem animação (fases de sprite) — usado para decidir se a luz que
+    /// ele emite flickera (fogo, vela, tocha) ou fica estática.
+    pub fn is_animated(&self) -> bool {
+        !self.animation_phases.is_empty()
+    }
 }
 
 /// Tabela de itens indexada por `id` (ItemDatabase).

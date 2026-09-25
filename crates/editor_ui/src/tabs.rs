@@ -16,21 +16,23 @@ const LENS_MIST_STRENGTH: f32 = 0.250;
 /// Força fixa do halation de fósforo do CRT Bloom (sem slider), de dia.
 const CRT_BLOOM_STRENGTH: f32 = 0.200;
 
-/// Flicker de luzes por classe de tamanho/cor:
-/// - QUENTE (vermelho dominante) pequeno/médio: oscilação caótica, com
-///   frequências em razões por φ (nunca repetem o padrão). Força empuxa
-///   para as luzes pequenas (some nas grandes). Tem pop/hard edge ocasionais.
-/// - FRIO pequeno: flicker RÍTMICO em 0.6Hz, raio bem pequeno (cristais/etc).
-/// - GRANDE (qualquer cor): leve respiração ~0.024Hz, quase imperceptível.
-const FIRE_WARM_SLOW: f32 = 0.015;
-const FIRE_WARM_MID: f32 = 0.035;
-const FIRE_WARM_FAST: f32 = 0.050;
-const FIRE_POP_AMP: f32 = 0.045;
-const FIRE_COLD_AMP: f32 = 0.040;
-const FIRE_COLD_RADIUS: f32 = 0.020;
-const FIRE_BIG_BREATH: f32 = 0.020;
-const FIRE_BIG_RADIUS: f32 = 0.015;
-const FIRE_WARM_RADIUS: f32 = 0.012;
+/// Flicker de luzes de itens ANIMADOS, contínuo por cor/tamanho:
+/// - SEM animação → luz estática (o `is_animated` vem no TileLight).
+/// - MENOR → caos moderado, rápido, raio sutil; MAIOR → ainda mais sutil e
+///   lento (nunca zera: sempre há um piso de amplitude).
+/// - QUENTE (vermelho dominante): caos normal + raio normal.
+/// - FRIO: menos caótico (só bandas lenta/média, sem pop) e raio ×0.5.
+const FIRE_SLOW_AMP: f32 = 0.015;
+const FIRE_MID_AMP: f32 = 0.035;
+const FIRE_FAST_AMP: f32 = 0.032;
+const FIRE_POP_AMP: f32 = 0.030;
+const FIRE_RADIUS: f32 = 0.012;
+const FIRE_COLD_FADE: f32 = 0.55;
+const FIRE_COLD_RADIUS: f32 = 0.5;
+/// Piso de amplitude para luzes grandes (sutileza, nunca zero).
+const FIRE_LARGE_MIN: f32 = 0.25;
+/// Piso do raio para luzes grandes.
+const FIRE_LARGE_RADIUS: f32 = 0.15;
 
 /// Smoothstep 0→1 entre `e0` e `e1`, clamado.
 fn smoothstep01(e0: f32, e1: f32, x: f32) -> f32 {
@@ -38,65 +40,68 @@ fn smoothstep01(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Aplica os três regimes de flicker conforme cor/tamanho da luz. Ajusta
-/// color (brilho) e intensity (raio) por frame, determinístico por posição;
-/// nunca apaga a luz. Retorna inalterada se não pertence a nenhuma classe.
+/// Aplica o flicker contínuo a emissoras de item ANIMADO (luz estática não
+/// mexe). Tamanho é uma régua: pequena = caótica/rápida/raio vivo, grande =
+/// sutil/lenta/raio quase parado. Cor define o caráter: quente caótica e fria
+/// calma. Ajusta color (brilho) e intensity (raio) por frame, determinístico
+/// por posição; nunca apaga a luz.
 fn flicker_light(mut light: editor_render::scene::TileLight, t: f32) -> editor_render::scene::TileLight {
+    // Item emissor não-animado → luz estática (sem flicker).
+    if light.is_animated == 0 {
+        return light;
+    }
     let r = light.color[0];
     let g = light.color[1];
     let b = light.color[2];
     let warm = r > g && r >= b;
     let size = light.intensity;
 
-    // Faixa de flicker: pequenas (≤2.5) têm força 1; médias (até ~7) vão
-    // sumindo (empurra para as pequenas); grandes (7.5–10.5 sobem p/ 1) viram
-    // respiração quase imperceptível.
-    let smallness = 1.0 - smoothstep01(2.5, 7.0, size);
-    let largeness = smoothstep01(7.5, 10.5, size);
-    if smallness <= 0.0 && largeness <= 0.0 {
-        return light;
-    }
+    // "Domesticação" contínua pelo tamanho: pequena (≤2.5) → vivid 1 (caos
+    // total); grande (≥8) → vivid 0 (sutil, lento). Nunca desliga.
+    let tame = smoothstep01(2.5, 8.0, size);
+    let vivid = 1.0 - tame;
+
+    // Cor: frias metade do caos e metade do raio.
+    let chaos = if warm { 1.0 } else { FIRE_COLD_FADE };
+    let rad_f = if warm { 1.0 } else { FIRE_COLD_RADIUS };
+
+    // Amplitudes: escala com vivid, com piso para grandes.
+    let amp = (FIRE_LARGE_MIN + (1.0 - FIRE_LARGE_MIN) * vivid) * chaos;
+    let rad_amp = FIRE_RADIUS * (FIRE_LARGE_RADIUS + (1.0 - FIRE_LARGE_RADIUS) * vivid) * rad_f;
+    // Velocidade: pequena rápida (~1.4×), grande lenta (~0.55×).
+    let speed = 1.4 - 0.85 * tame;
 
     let tx = light.world_pos[0].floor();
     let ty = light.world_pos[1].floor();
-    // Seed 0..1 derivado da posição (luzes próximas "desencronizam").
+    // Seed 0..1 derivado da posição (chamas próximas "desencronizam").
     let h = (f32::sin(tx * 12.9898 + ty * 78.233) * 43758.545).fract();
     let tau = std::f32::consts::TAU;
     let phi = 1.618_034;
+    let st = t * speed;
 
     // Frequências base w e potências de φ (razões irracionais → batimentos
     // que nunca repetem; "chocam" em vez de marcar o ritmo).
     let w = 1.9;
-    let s1 = f32::sin(t * w * phi + h * tau);                       // ~0.49 Hz
-    let s2 = f32::sin(t * w + h * tau * 1.43);                      // ~0.30 Hz (razão ~φ)
-    let slow = 0.5 * s1 + 0.5 * s2;                                 // batimento irregular
-    let s3 = f32::sin(t * w * phi * phi + h * tau * 2.37 + 1.4 * s1);        // ~1.28 Hz
-    let s4 = f32::sin(t * w * phi * phi * phi + h * tau * 3.13 + 2.1 * s3);  // ~3.28 Hz
+    let s1 = f32::sin(st * w * phi + h * tau);                               // ~0.49 Hz × speed
+    let s2 = f32::sin(st * w + h * tau * 1.43);                              // ~0.30 Hz (razão ~φ)
+    let slow = 0.5 * s1 + 0.5 * s2;                                          // batimento irregular
+    let s3 = f32::sin(st * w * phi * phi + h * tau * 2.37 + 1.4 * s1);       // ~1.28 Hz × speed
+    let s4 = f32::sin(st * w * phi * phi * phi + h * tau * 3.13 + 2.1 * s3); // ~3.28 Hz × speed
 
-    // Hard edges ocasionais: valor quantizado por célula (~4.5Hz), muda de
+    // Hard edges ocasionais (só quentes): valor quantizado por célula, muda de
     // salto e é diferente em cada chama.
-    let cell = (t * 4.5).floor();
+    let cell = (st * 4.5).floor();
     let r0 = (f32::sin(cell * 1.7 + h * 91.7) * 43758.545).fract();
     let pop = r0 - 0.5;
 
-    let mut d = 0.0;
-    let mut rf = 1.0;
-    if warm {
-        let warm_w = smallness;
-        d += warm_w * (FIRE_WARM_SLOW * slow + FIRE_WARM_MID * s3 + FIRE_WARM_FAST * s4 + FIRE_POP_AMP * pop);
-        rf += warm_w * FIRE_WARM_RADIUS * (0.6 * s3 + 0.4 * s4);
+    let d = if warm {
+        amp * (FIRE_SLOW_AMP * slow + FIRE_MID_AMP * s3 + FIRE_FAST_AMP * s4)
+            + FIRE_POP_AMP * amp * pop
     } else {
-        // Frio pequeno: rítmico 0.6Hz, amplitude/raio pequenos.
-        let cold_w = smallness;
-        let rhythm = f32::sin(t * 2.0 * std::f32::consts::PI * 0.6 + h * tau);
-        d += cold_w * FIRE_COLD_AMP * rhythm;
-        rf += cold_w * FIRE_COLD_RADIUS * rhythm;
-    }
-    // Grande (qualquer cor): respiração extremamente lenta (~0.024Hz).
-    let big_w = largeness;
-    let breath = f32::sin(t * 0.15 + h * tau);
-    d += big_w * FIRE_BIG_BREATH * breath;
-    rf += big_w * FIRE_BIG_RADIUS * breath;
+        // Frio: só bandas lenta/média (sem fast, sem pop) → menos caótico.
+        amp * (FIRE_SLOW_AMP * slow + FIRE_MID_AMP * 0.8 * s3)
+    };
+    let rf = 1.0 + rad_amp * (0.6 * s3 + 0.4 * s4);
 
     let mult = (1.0 + d).max(0.5);
     for c in light.color.iter_mut() {

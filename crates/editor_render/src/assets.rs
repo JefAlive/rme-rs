@@ -52,6 +52,8 @@ pub struct ItemVisual {
     pub has_light: bool,
     pub light_color: u32,
     pub light_intensity: u32,
+    /// O item emissor tem sprite animado (fases) → a luz dele flickera.
+    pub is_animated: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -120,6 +122,7 @@ impl SpriteResolver {
         let has_light = item_type.has_light();
         let light_color = item_type.sprite.light_color;
         let light_intensity = item_type.sprite.light_intensity;
+        let is_animated = item_type.is_animated();
 
         let (offset_x, offset_y) = item_type.draw_offset();
         let visual = ItemVisual {
@@ -131,6 +134,7 @@ impl SpriteResolver {
             has_light,
             light_color,
             light_intensity,
+            is_animated,
         };
 
         // Em itens com padrões (paredes, portas, bordas etc.), o RME escolhe

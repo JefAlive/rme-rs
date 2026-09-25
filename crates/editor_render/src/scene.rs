@@ -10,12 +10,16 @@ use crate::{instance::TileInstance, pipeline::{CameraUniform, TileRenderResource
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TileLight {
     /// Centro da luz em coordenadas de mundo (tiles). OTClient posiciona a
-    /// fonte no centro do rect do sprite: tile + 0.5.
+    /// fonte no centro do rect do sprite: tile + 0.5. Para itens com elevação
+    /// (tochas penduradas etc.), a fonte sobe junto com o sprite (`elevation`
+    /// px em tela → `elevation/32` tiles, no mesmo eixo negativo dos dois
+    /// componentes do `pixel_offset` dos itens).
     pub world_pos: [f32; 2],
     /// Intensidade bruta (1..15 típico), usada como raio em tiles e no falloff
     pub intensity: f32,
-    /// Padding de alinhamento do vec3 abaixo (WGSL storage: align 16)
-    _pad0: f32,
+    /// 1 se o item emissor tem sprite animado — decidimos o flicker no CPU
+    /// (tabs.rs); a GPU não lê esse campo (atributos explícitos no layout).
+    pub is_animated: u32,
     /// Cor linear RGB 0..1 (convertida da paleta 6×6×6 do Tibia)
     pub color: [f32; 3],
     _pad1: f32,
@@ -118,11 +122,18 @@ fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position) -> T
         let b = (color8 % 6) as f32 * 51.0 / 255.0;
         (r, g, b)
     };
+    // Elevação (px) desloca a fonte junto com o item, no mesmo sentido do
+    // `pixel_offset` dos itens: -elevation/32 em ambos os eixos (tochas
+    // penduradas emitem de cima da base do tile).
+    let elevation_px = visual.elevation;
     TileLight {
-        // OTClient usa o centro do rect do sprite (tile * 32 + 16 px) → tile + 0.5
-        world_pos: [pos.x as f32 + 0.5, pos.y as f32 + 0.5],
+        // OTClient usa o centro do rect do sprite (tile * 32 + 16 px) → tile + 0.5.
+        world_pos: [
+            pos.x as f32 + 0.5 - elevation_px / 32.0,
+            pos.y as f32 + 0.5 - elevation_px / 32.0,
+        ],
         intensity: visual.light_intensity as f32,
-        _pad0: 0.0,
+        is_animated: u32::from(visual.is_animated),
         color: [r, g, b],
         _pad1: 0.0,
     }
