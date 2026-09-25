@@ -61,6 +61,7 @@ pub struct ScaleResources {
     pipeline_mdapt: [wgpu::RenderPipeline; 5],
     pipeline_crt_color: wgpu::RenderPipeline,
     pipeline_crt_bloom: wgpu::RenderPipeline,
+    pipeline_lens_mist: wgpu::RenderPipeline,
     pipeline_linear_to_srgb: wgpu::RenderPipeline,
     pipeline_lights: wgpu::RenderPipeline,
     pipeline_apply_light: wgpu::RenderPipeline,
@@ -71,6 +72,7 @@ pub struct ScaleResources {
     layout_mdapt_dual: wgpu::BindGroupLayout,
     layout_crt_color: wgpu::BindGroupLayout,
     layout_crt_bloom: wgpu::BindGroupLayout,
+    layout_lens_mist: wgpu::BindGroupLayout,
     layout_linear_to_srgb: wgpu::BindGroupLayout,
     layout_lights: wgpu::BindGroupLayout,
     layout_apply_light: wgpu::BindGroupLayout,
@@ -123,6 +125,7 @@ impl ScaleResources {
         let mdapt4_fragment = Self::glsl_shader(device, "mdapt4", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/mdapt4.frag"));
         let crt_color_fragment = Self::glsl_shader(device, "crt_color", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_color.frag"));
         let crt_bloom_fragment = Self::glsl_shader(device, "crt_bloom", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/crt_bloom.frag"));
+        let lens_mist_fragment = Self::glsl_shader(device, "lens_mist", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/lens_mist.frag"));
         let linear_to_srgb_fragment = Self::glsl_shader(device, "linear_to_srgb", wgpu::naga::ShaderStage::Fragment, include_str!("../assets/linear_to_srgb.frag"));
         // Shader WGSL da iluminação: light_buffer (quads por fonte, blend Max)
         // e apply_light (multiplicação cena × light buffer em linear).
@@ -178,6 +181,7 @@ impl ScaleResources {
         // linear no bloom; o CRT colour é um shift por texel, tanto faz).
         let layout_crt_color = Self::glsl_layout_filter(device, "scene_scaler_crt_color_bgl", None);
         let layout_crt_bloom = Self::glsl_layout_filter(device, "scene_scaler_crt_bloom_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
+        let layout_lens_mist = Self::glsl_layout_filter(device, "scene_scaler_lens_mist_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
         // Layout para conversão final linear→sRGB: textura + sampler linear, sem uniforms.
         let layout_linear_to_srgb = Self::glsl_layout_filter(device, "scene_scaler_linear_to_srgb_bgl", None);
 
@@ -243,6 +247,7 @@ impl ScaleResources {
         ];
         let pipeline_crt_color = Self::pipeline(device, "scene_scaler_crt_color", &layout_crt_color, &glsl_vertex, "main", &crt_color_fragment, "main");
         let pipeline_crt_bloom = Self::pipeline(device, "scene_scaler_crt_bloom", &layout_crt_bloom, &glsl_vertex, "main", &crt_bloom_fragment, "main");
+        let pipeline_lens_mist = Self::pipeline(device, "scene_scaler_lens_mist", &layout_lens_mist, &glsl_vertex, "main", &lens_mist_fragment, "main");
         let pipeline_linear_to_srgb = Self::pipeline(device, "scene_scaler_linear_to_srgb", &layout_linear_to_srgb, &glsl_vertex, "main", &linear_to_srgb_fragment, "main");
 
         // Layout da iluminação: (0) CameraUniform estático. As fontes de luz
@@ -421,7 +426,7 @@ impl ScaleResources {
         });
         let light_texture_view = light_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, pipeline_linear_to_srgb, pipeline_lights, pipeline_apply_light, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, layout_linear_to_srgb, layout_lights, layout_apply_light, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear, light_buffer, light_buffer_capacity: 64, light_camera_uniform, light_texture, light_texture_view, light_texture_size: (1, 1) }
+        Self { pipeline_plain, pipeline_xbrz, pipeline_super_2xsai, pipeline_mdapt, pipeline_crt_color, pipeline_crt_bloom, pipeline_lens_mist, pipeline_linear_to_srgb, pipeline_lights, pipeline_apply_light, layout_plain, layout_xbrz, layout_super_2xsai, layout_mdapt, layout_mdapt_dual, layout_crt_color, layout_crt_bloom, layout_lens_mist, layout_linear_to_srgb, layout_lights, layout_apply_light, uniform_plain, uniform_xbrz, uniform_super_2xsai, uniform_tex_size, sampler, sampler_linear, light_buffer, light_buffer_capacity: 64, light_camera_uniform, light_texture, light_texture_view, light_texture_size: (1, 1) }
     }
 
     fn glsl_layout(device: &wgpu::Device, label: &'static str, uniform_min_size: u64) -> wgpu::BindGroupLayout {
@@ -681,16 +686,17 @@ impl ScaleResources {
         queue.submit(Some(encoder.finish()));
     }
 
-    /// CRT bloom (halo de fósforo, sem scanlines) aplicado na imagem final já
+    /// CRT bloom (halation de fósforo, sem scanlines) aplicado na imagem final já
     /// upscaled. Amostra com o sampler linear (offsets de halo fracionários).
-    /// `world_light` em [0,1] (metodo Tibia): menor valor = glow mais ativo
-    /// (estilo neon 80s), maior valor = glow atenuado (sem embranquecer).
+    /// Desacoplado do World Light: a força é constante e ajustável — `strength`
+    /// controla a intensidade do halo (screen blend: pretos com bleed fino,
+    /// brancos intactos). Raio por canal em `Params.y` (reservado, 1.0).
     pub fn post_bloom(&self, device: &wgpu::Device, queue: &wgpu::Queue,
                       source_size: (u32, u32), source: &wgpu::TextureView,
-                      target: &wgpu::TextureView, world_light: f32) {
+                      target: &wgpu::TextureView, strength: f32) {
         queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
             texture_size: [source_size.0 as f32, source_size.1 as f32],
-            params: [world_light, 0.0],
+            params: [strength, 1.0],
         }));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene_scaler_bloom_bg"), layout: &self.layout_crt_bloom,
@@ -701,6 +707,28 @@ impl ScaleResources {
             ],
         });
         self.encode_draw(device, queue, &self.pipeline_crt_bloom, &bind_group, target, "scene_scaler_bloom_pass");
+    }
+
+    /// Lens mist (névoa difusa de lente, veiling glare) sobre a imagem final.
+    /// out = mix(cena, blur_grosso(cena), strength): mix nunca adiciona energia,
+    /// então não clareia a noite — só amacia as bordas de brilho. Sem lift de
+    /// pretos. Raio do blur em px de tela (3.0), acompanha o zoom.
+    pub fn post_mist(&self, device: &wgpu::Device, queue: &wgpu::Queue,
+                     source_size: (u32, u32), source: &wgpu::TextureView,
+                     target: &wgpu::TextureView, strength: f32) {
+        queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
+            texture_size: [source_size.0 as f32, source_size.1 as f32],
+            params: [strength, 0.0],
+        }));
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene_scaler_lens_mist_bg"), layout: &self.layout_lens_mist,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.uniform_tex_size.as_entire_binding() },
+            ],
+        });
+        self.encode_draw(device, queue, &self.pipeline_lens_mist, &bind_group, target, "scene_scaler_lens_mist_pass");
     }
 
     /// CRT colour: fosforo P22 (NTSC D65) aplicado fielmente à imagem final.

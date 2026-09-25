@@ -117,15 +117,34 @@ impl AntiAliasing {
 /// Seção "Shaders" da aba World (abaixo de Anti-aliasing):
 /// - checkerboard dithering: MDAPT (Sp00kyFox) rodado na cena nativa (1x)
 ///   antes do upscaling, para fundir os padrões de transparência do Tibia;
+/// - lens mist: névoa difusa de lente (veiling glare) sobre a cena final.
+///   mix com o próprio blur, não clareia a noite — só amacia bordas de brilho;
 /// - crt color: gama de fósforo SMPTE-C/Rec.601 aplicada ao RGB final
 ///   (vermelho leve-dessaturado pro laranja, azul pro ciano, branco ok);
-/// - crt bloom: halo de fósforo pós-upscaling, sem scanlines, extensão
-///   acompanha o zoom (roda na resolução final do painel).
-#[derive(Default, Clone, Copy)]
+/// - crt bloom: halation de fósforo pós-upscaling, sem scanlines, extensão
+///   acompanha o zoom (roda na resolução final do painel). Força desacoplada
+///   do World Light (screen blend: pretos com bleed fino, brancos intactos).
+#[derive(Clone, Copy)]
 pub struct ShaderOptions {
     pub checkerboard_dither: bool,
+    pub lens_mist: bool,
+    pub lens_mist_strength: f32,
     pub crt_color: bool,
     pub crt_bloom: bool,
+    pub crt_bloom_strength: f32,
+}
+
+impl Default for ShaderOptions {
+    fn default() -> Self {
+        Self {
+            checkerboard_dither: false,
+            lens_mist: false,
+            lens_mist_strength: 0.05,
+            crt_color: false,
+            crt_bloom: false,
+            crt_bloom_strength: 0.08,
+        }
+    }
 }
 
 /// Estado global compartilhado entre abas.
@@ -628,15 +647,25 @@ impl<'a> EditorTabViewer<'a> {
                     );
                 }
 
-                // Pós "Shaders" na imagem final: CRT bloom depois do upscaling
-                // (a extensão acompanha o zoom), CRT colour (P22) por último.
-                // O resultado termina sempre no target de apresentação `output`.
-                if self.state.shaders.crt_color || self.state.shaders.crt_bloom {
+                // Pós "Shaders" na imagem final (depois do upscaling, extensão acompanha
+                // o zoom): lens mist (névoa) > CRT bloom (halation) > CRT colour
+                // (P22) por último. Ambos os efeitos são desacoplados do World
+                // Light — atuam sobre a cena final já iluminada, sem clarear a
+                // noite nem lavar o dia. O resultado termina sempre em `output`.
+                if self.state.shaders.lens_mist || self.state.shaders.crt_bloom || self.state.shaders.crt_color {
                     if let Some(post) = &self.state.post_target {
                         let post_size = (output.width, output.height);
-                        if self.state.shaders.crt_bloom {
-                            let wl = if self.state.world_light < 15 { 15 } else { self.state.world_light } as f32 / 100.0;
-                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view, wl);
+                        if self.state.shaders.lens_mist {
+                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, self.state.shaders.lens_mist_strength);
+                            if self.state.shaders.crt_bloom {
+                                scaler.post_bloom(device, queue, post_size, &post.view, &output.view, self.state.shaders.crt_bloom_strength);
+                            } else if self.state.shaders.crt_color {
+                                scaler.post_color(device, queue, &post.view, &output.view);
+                            } else {
+                                scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
+                            }
+                        } else if self.state.shaders.crt_bloom {
+                            scaler.post_bloom(device, queue, post_size, &output.view, &post.view, self.state.shaders.crt_bloom_strength);
                             if self.state.shaders.crt_color {
                                 scaler.post_color(device, queue, &post.view, &output.view);
                             } else {
@@ -789,10 +818,20 @@ fn ui_world(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Shaders").weak());
         ui.checkbox(&mut self.state.shaders.checkerboard_dither, "Checkerboard Dithering (MDAPT)")
             .on_hover_text("Merge Dithering and Pseudo Transparency (MDAPT, Sp00kyFox): funde os padrões de dithering/transparência antes do upscaling, quando a cena está em 1x.");
+        ui.checkbox(&mut self.state.shaders.lens_mist, "Lens Mist (névoa)")
+            .on_hover_text("Névoa difusa de lente (veiling glare) sobre a cena final. mix com o próprio blur: não clareia a noite, só amacia as bordas de brilho como uma lente com mist.");
+        if self.state.shaders.lens_mist {
+            ui.add(egui::Slider::new(&mut self.state.shaders.lens_mist_strength, 0.0..=0.25)
+                .text("Lens Mist strength"));
+        }
         ui.checkbox(&mut self.state.shaders.crt_color, "CRT Colour (Rec.601)")
             .on_hover_text("Gama de fósforo SMPTE-C/Rec.601 (P22 dos CRTs de consumo, grade.glsl/Dogway): vermelho fica levemente dessaturado e esquenta pro laranja, azul puxa pro ciano, branco preservado — sem boost de saturação.");
         ui.checkbox(&mut self.state.shaders.crt_bloom, "CRT Bloom")
-            .on_hover_text("Halo de fósforo aplicado depois do upscaling, sem scanlines; a extensão do bloom acompanha o zoom e brancos não estouram.");
+            .on_hover_text("Halation de fósforo sobre a cena final, sem scanlines; desacoplado do World Light e com screen blend: pretos recebem bleed fino, brancos ficam intactos (não lava o dia).");
+        if self.state.shaders.crt_bloom {
+            ui.add(egui::Slider::new(&mut self.state.shaders.crt_bloom_strength, 0.0..=0.4)
+                .text("CRT Bloom strength"));
+        }
     }
 
     fn ui_inspector(&mut self, ui: &mut Ui) {
