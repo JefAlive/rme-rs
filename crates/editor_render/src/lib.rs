@@ -5,3 +5,4 @@ pub mod scene;
 pub mod atlas;
 pub mod assets;
 pub mod scaler;
+pub mod spectrum;

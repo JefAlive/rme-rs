@@ -5,12 +5,10 @@ const PAN_SPEED_TILES_PER_SEC: f32 = 12.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 8.0;
 
-/// Piso do ambiente (World Light) em percentual. OTClient não tem piso no
-/// "Ambient Light" (default 0) — com luz global 0 fica preto puro; aqui
-/// mantemos 8% só para o editor não virar abismo no slider 0.
-const MIN_AMBIENT_PCT: u8 = 8;
-
-/// Força fixa do lens mist (sem slider): névoa de lente à noite.
+/// Slider de "World Light" virou um relógio de 24h: 0 = 00:00 (meia-noite),
+/// 50 = meio-dia, 100 = 24:00 (meia-noite de novo). Intensidade e cor do
+/// ambiente vêm do espectro (16 bandas) de cada hora. Força fixa do lens
+/// mist (sem slider): névoa de lente à noite.
 const LENS_MIST_STRENGTH: f32 = 0.250;
 
 /// Força fixa do halation de fósforo do CRT Bloom (sem slider), de dia.
@@ -388,7 +386,7 @@ pub struct AppState {
     pub city_filter: String,
     pub item_name_filter: String,
 
-    pub world_light: u8,
+    pub world_light: f32,
     pub show_tooltips: bool,
     pub show_npcs: bool,
     pub show_monsters: bool,
@@ -437,7 +435,7 @@ impl Default for AppState {
             brush_size: 1,
             city_filter: String::new(),
             item_name_filter: String::new(),
-            world_light: 100,
+            world_light: 50.0,
             show_tooltips: true,
             show_npcs: true,
             show_monsters: true,
@@ -785,9 +783,14 @@ impl<'a> EditorTabViewer<'a> {
                 }
             }
 
-            // Iluminação (método OTClient): só ativa quando há dimming real
-            // (isDark: < 0.99). Em dia pleno (slider 100) não há pass de luz.
-            let lights_active = (self.state.world_light as f32 / 100.0) < 0.99;
+            // Ciclo de luz (espectro de 16 bandas): o slider virou relógio —
+            // 0/100 = meia-noite, 50 = meio-dia. O ambiente RGB e o fator de
+            // brilho `day` (1 no meio-dia) saem do espectro; ao meio-dia o
+            // pass de luz é identidade (multiplicar por branco) e é pulado.
+let hour = self.state.world_light / 100.0 * 24.0;
+            let day = editor_render::spectrum::day_factor(hour);
+            let ambient = editor_render::spectrum::ambient_rgb(hour);
+            let lights_active = (day - 1.0).abs() > 5e-3;
             if lights_active {
                 match &mut self.state.light_target {
                     Some(target) => target.resize_if_needed(device, scene_width, scene_height),
@@ -803,7 +806,7 @@ impl<'a> EditorTabViewer<'a> {
                 viewport_size: [scene_width as f32, scene_height as f32],
                 floor_alpha: 1.0,
                 sampling_mode: 0,
-                light: if self.state.world_light < MIN_AMBIENT_PCT { MIN_AMBIENT_PCT } else { self.state.world_light } as f32 / 100.0,
+                light: day,
                 _pad_light: 0,
                 anim_time_ms: 0,
                 _pad_anim: 0,
@@ -824,7 +827,6 @@ impl<'a> EditorTabViewer<'a> {
                 // O resultado "iluminado" fica num alvo próprio (`light_target`)
                 // para não ter feedback de leitura/escrita no mesmo alvo.
                 let base_scene: &editor_render::offscreen::SceneTarget = if lights_active {
-                    let ambient = if self.state.world_light < MIN_AMBIENT_PCT { MIN_AMBIENT_PCT } else { self.state.world_light } as f32 / 100.0;
                     let ox = camera.offset[0];
                     let oy = camera.offset[1];
                     let vw = camera.viewport_size[0];
@@ -859,7 +861,7 @@ impl<'a> EditorTabViewer<'a> {
                             None => visible_lights.push(*light),
                         }
                     }
-                    scaler.render_lights(device, queue, &camera, &visible_lights, (scene_width, scene_height), [ambient; 3]);
+                    scaler.render_lights(device, queue, &camera, &visible_lights, (scene_width, scene_height), ambient);
                     let lit = self.state.light_target.as_ref().unwrap();
                     scaler.apply_light(device, queue, &scene.view, &lit.view);
                     lit
@@ -903,8 +905,8 @@ impl<'a> EditorTabViewer<'a> {
                     if let Some(post) = &self.state.post_target {
                         let post_size = (output.width, output.height);
                         if self.state.shaders.crt_bloom {
-                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, LENS_MIST_STRENGTH, self.state.world_light);
-                            scaler.post_bloom(device, queue, post_size, &post.view, &output.view, CRT_BLOOM_STRENGTH, self.state.world_light);
+                            scaler.post_mist(device, queue, post_size, &output.view, &post.view, LENS_MIST_STRENGTH, day);
+                            scaler.post_bloom(device, queue, post_size, &post.view, &output.view, CRT_BLOOM_STRENGTH, day);
                             if self.state.shaders.crt_color {
                                 scaler.post_color(device, queue, post_size, &output.view, &post.view, CRT_COLOR_STRENGTH);
                                 scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
@@ -1034,8 +1036,13 @@ impl<'a> EditorTabViewer<'a> {
     }
 
 fn ui_world(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("World Light").weak());
-        ui.add(egui::Slider::new(&mut self.state.world_light, 0..=100));
+        // Slider "pesado": estica na largura toda do painel → cada % tem mais
+        // pixels, arrasta bem mais pra mexer pouco (precisão fina). Valor f32
+        // sobe/desce suave com números quebrados, não degraus inteiros.
+        ui.label(RichText::new("Day Cycle").weak());
+        let slider_w = ui.available_width().max(120.0);
+        ui.spacing_mut().slider_width = slider_w;
+        ui.add(egui::Slider::new(&mut self.state.world_light, 0.0..=100.0));
         ui.separator();
         ui.checkbox(&mut self.state.show_tooltips, "Show Tooltips");
         ui.checkbox(&mut self.state.show_npcs, "Show NPCs");

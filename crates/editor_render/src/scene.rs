@@ -114,15 +114,23 @@ impl ChunkGpuCache {
 }
 
 fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position, is_ground: u32) -> TileLight {
-    // Converte cor 8-bit Tibia (6×6×6) para RGB linear 0..1
+    // Cor 8-bit da paleta 6×6×6 do Tibia — usamos só o MATIZ para
+    // classificar o emissor: QUENTE (vermelho dominante) → espectro do fogo;
+    // FRIO → neon frio. As cores aplicadas vêm do espectro de 16 bandas
+    // (`fire_rgb` / `neon_cold_rgb`), não da paleta bruta.
     let color8 = visual.light_color;
-    let (r, g, b) = if color8 == 0 || color8 >= 216 {
+    let (r, _g, b) = if color8 == 0 || color8 >= 216 {
         (0.0, 0.0, 0.0)
     } else {
         let r = ((color8 / 36) % 6) as f32 * 51.0 / 255.0;
         let g = ((color8 / 6) % 6) as f32 * 51.0 / 255.0;
         let b = (color8 % 6) as f32 * 51.0 / 255.0;
         (r, g, b)
+    };
+    let color = if r - b > 0.05 {
+        crate::spectrum::fire_rgb()
+    } else {
+        crate::spectrum::neon_cold_rgb()
     };
     // Elevação (px) desloca a fonte junto com o item, no mesmo sentido do
     // `pixel_offset` dos itens: -elevation/32 em ambos os eixos (tochas
@@ -136,7 +144,7 @@ fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position, is_g
         ],
         intensity: visual.light_intensity as f32,
         is_animated: u32::from(visual.is_animated),
-        color: [r, g, b],
+        color,
         is_ground,
     }
 }
@@ -220,6 +228,7 @@ pub struct FloorLayer {
 
 /// Render-to-texture: um encoder próprio, um draw call por `FloorLayer`,
 /// cada um lendo sua própria fatia do uniform buffer via dynamic offset.
+#[allow(clippy::too_many_arguments)]
 pub fn render_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
