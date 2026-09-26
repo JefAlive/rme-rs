@@ -190,6 +190,11 @@ impl eframe::App for RmeApp {
                     .style(Style::from_egui(ui.style().as_ref()))
                     .show_inside(ui, &mut EditorTabViewer { state: &mut self.state });
             });
+
+        // Só redesenhar por evento congela a cena quando o mouse para de se
+        // mexer (ou sai do editor) — as animações de sprite usam esse relógio
+        // no vertex shader, então pedimos redraw contínuo como num jogo.
+        ctx.request_repaint();
     }
 }
 

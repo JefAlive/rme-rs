@@ -10,6 +10,12 @@ struct Camera {
     // 1 = claro). O fósforo continua emitindo (o bloom recupera o brilho
     // original dividindo por este valor), só o ambiente escurece.
     light: f32,
+    _pad_light: u32,
+    // Relógio monotônico da animação de sprites (ms). Fase dos itens
+    // animados: (t + seed) / dur % frames — mesmo modelo do OTClient
+    // `Item::calculateAnimationPhase` (tick padrão de 500ms).
+    anim_time_ms: u32,
+    _pad_anim: u32,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -21,6 +27,8 @@ struct VsIn {
     @location(2) pixel_offset: vec2<f32>,
     @location(3) layer_index: u32,
     @location(4) tint: vec4<f32>,
+    @location(5) anim_meta: u32,
+    @location(6) anim_clock: u32,
 };
 
 struct VsOut {
@@ -43,8 +51,23 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = vec4<f32>(ndc, 0.0, 1.0);
     out.uv = in.quad_pos;
-    out.layer = in.layer_index;
     out.tint = in.tint;
+
+    // Fase da animação: as fases do item foram pré-decodificadas contíguas no
+    // atlas (frame é a dimensão mais externa do sprite_index do RME), então
+    // a fase corrente apenas soma `frame * step_cells` ao layer_index-base.
+    var layer = in.layer_index;
+    let frames = in.anim_meta & 0xffu;
+    if (frames > 0u) {
+        let step_cells = (in.anim_meta >> 8u) & 0xffffu;
+        // dur_ms 0 → 500 (padrão OTClient/RME); seed dessincroniza async.
+        let dur_ms = max(in.anim_clock & 0xffffu, 1u);
+        let seed_ms = (in.anim_clock >> 16u) & 0xffffu;
+        let phase = (camera.anim_time_ms + seed_ms) / dur_ms;
+        let frame = phase % frames;
+        layer = layer + frame * step_cells;
+    }
+    out.layer = layer;
     return out;
 }
 

@@ -30,6 +30,11 @@ pub struct CameraUniform {
     /// 0 = escuro, 1 = inalterado.
     pub light: f32,
     pub _pad_light: u32,
+    /// Relógio monotônico de animação (ms). O vertex shader calcula a fase
+    /// dos sprites animados com (t + seed)/dur % frames no estilo OTClient
+    /// (`Item::calculateAnimationPhase`, tick padrão de 500ms).
+    pub anim_time_ms: u32,
+    pub _pad_anim: u32,
 }
 
 impl TileRenderResources {

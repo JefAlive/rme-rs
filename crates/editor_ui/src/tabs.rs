@@ -417,6 +417,9 @@ pub struct AppState {
     pub atlas: Option<editor_render::atlas::SpriteAtlas>,
     pub sprite_resolver: Option<editor_render::assets::SpriteResolver>,
     pub camera_fit_pending: bool,
+    /// Relógio monotônico da animação de sprites (estilo OTClient/RME,
+    /// tick padrão de 500ms por fase).
+    pub anim_started: std::time::Instant,
 }
 
 impl Default for AppState {
@@ -460,6 +463,7 @@ impl Default for AppState {
             atlas: None,
             sprite_resolver: None,
             camera_fit_pending: true,
+            anim_started: std::time::Instant::now(),
         }
     }
 }
@@ -572,6 +576,11 @@ impl<'a> EditorTabViewer<'a> {
                 self.state.camera_offset += dir.normalized() * world_px_per_sec * dt;
             }
 
+            // Sem repaint contínuo, o egui só redesenha em eventos e a cena
+            // congela — as animações de sprite (relógio do vertex shader)
+            // precisam de redraw a cada frame como num cliente de jogo. O
+            // repaint incondicional fica no `App::update` de main.rs; aqui
+            // ele seria executado só com o mouse sobre o editor (hovered).
             if ui.input(|i| i.key_pressed(egui::Key::Q)) {
                 self.state.current_floor_display =
                     (self.state.current_floor_display + 1).min(editor_core::position::MAP_MAX_Z);
@@ -579,9 +588,6 @@ impl<'a> EditorTabViewer<'a> {
             if ui.input(|i| i.key_pressed(egui::Key::E)) {
                 self.state.current_floor_display = self.state.current_floor_display.saturating_sub(1);
             }
-
-            // WASD precisa de repaint contínuo enquanto a tecla está segurada.
-            ui.ctx().request_repaint();
         }
 
         if let Some(wgpu_state) = self.state.wgpu.clone() {
@@ -799,6 +805,8 @@ impl<'a> EditorTabViewer<'a> {
                 sampling_mode: 0,
                 light: if self.state.world_light < MIN_AMBIENT_PCT { MIN_AMBIENT_PCT } else { self.state.world_light } as f32 / 100.0,
                 _pad_light: 0,
+                anim_time_ms: 0,
+                _pad_anim: 0,
             };
             if let (Some(resources), Some(atlas), Some(scene), Some(output), Some(scaler)) = (
                 &self.state.tile_resources, &self.state.atlas, &self.state.scene_target,
@@ -807,6 +815,7 @@ impl<'a> EditorTabViewer<'a> {
                 editor_render::scene::render_frame(
                     device, queue, resources, &self.state.chunk_cache, atlas,
                     &scene.view, camera, &layers,
+                    self.state.anim_started.elapsed().as_millis() as u32,
                 );
 
                 // Pass de luz: light buffer (ambiente + quads das fontes, blend

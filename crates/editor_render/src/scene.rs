@@ -149,6 +149,19 @@ fn append_visual_instances(
 ) {
     let width = visual.width.max(1) as u32;
     let height = visual.height.max(1) as u32;
+
+    // Itens async dessincronizam por posição do tile (estilo RME: cada
+    // instância tem temporizador próprio). Sincronizados usam fase global.
+    let seed = if visual.anim_frames > 0 && visual.anim_async {
+        anim_seed(pos.x as u32, pos.y as u32, pos.z as u32)
+    } else {
+        0
+    };
+    let anim_frames = visual.anim_frames.min(0xff);
+    let anim_step = visual.anim_step.min(0xffff);
+    let anim_clock = (visual.anim_dur_ms.min(0xffff))
+        | (seed << 16);
+
     for part_y in 0..height {
         for part_x in 0..width {
             let x_offset = part_x as i32 - (width as i32 - 1);
@@ -163,9 +176,22 @@ fn append_visual_instances(
                 ],
                 layer_index: visual.layer_index + part_y * width + part_x,
                 tint: [1.0, 1.0, 1.0, 1.0],
+                anim_meta: anim_frames | (anim_step << 8),
+                anim_clock,
             });
         }
     }
+}
+
+/// Hash determinístico (splitmix-style) de uma posição de tile, usado como
+/// seed de dessincronização de animações async.
+fn anim_seed(x: u32, y: u32, z: u32) -> u32 {
+    let mut h = x.wrapping_add(y.wrapping_mul(0x9e3779b9)).wrapping_add(z.wrapping_mul(0x85ebca6b));
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x7feb352d);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x846ca68b);
+    h ^ (h >> 16)
 }
 
 fn upload_instances(
@@ -203,6 +229,7 @@ pub fn render_frame(
     target: &wgpu::TextureView,
     base_camera: CameraUniform,
     layers: &[FloorLayer],
+    anim_ms: u32,
 ) {
     let stride = resources.camera_stride as u64;
     for (i, layer) in layers.iter().enumerate().take(crate::pipeline::MAX_FLOOR_LAYERS) {
@@ -211,6 +238,7 @@ pub fn render_frame(
         cam.offset[1] += layer.pixel_offset[1];
         cam.atlas_columns = atlas.columns();
         cam.floor_alpha = layer.alpha;
+        cam.anim_time_ms = anim_ms;
         queue.write_buffer(&resources.camera_buf, i as u64 * stride, bytemuck::cast_slice(&[cam]));
     }
 

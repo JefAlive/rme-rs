@@ -416,7 +416,7 @@ impl ScaleResources {
             contents: bytemuck::bytes_of(&CameraUniform {
                 offset: [0.0; 2], zoom: [1.0; 2], atlas_columns: 1, _align_pad: 0,
                 viewport_size: [1.0, 1.0], floor_alpha: 1.0, sampling_mode: 0,
-                light: 1.0, _pad_light: 0,
+                light: 1.0, _pad_light: 0, anim_time_ms: 0, _pad_anim: 0,
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });

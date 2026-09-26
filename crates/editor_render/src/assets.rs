@@ -34,6 +34,9 @@ pub struct SpriteResolver {
     sheet_cache: AHashMap<u32, Arc<DecodedSheet>>,
     /// Cache `sprite_id → blocos 32×32 contíguos` no atlas.
     sprite_layer: AHashMap<u32, CachedSprite>,
+    /// Cache por `type_id` do bloco contíguo de fases de itens animados
+    /// (todas as fases × padrões × layers, em ordem de `sprite_index`).
+    anim_block: AHashMap<u16, AnimBlockInfo>,
     resolved: u64,
     cache_hits: u64,
     decode_failures: u64,
@@ -54,6 +57,16 @@ pub struct ItemVisual {
     pub light_intensity: u32,
     /// O item emissor tem sprite animado (fases) → a luz dele flickera.
     pub is_animated: bool,
+    /// Número de fases da animação; 0 = estático (layer_index fixo).
+    pub anim_frames: u32,
+    /// Avanço em células do atlas entre fases consecutivas (sprites por frame
+    /// × blocos 32×32 do sprite). As fases são pré-decodificadas contíguas.
+    pub anim_step: u32,
+    /// Duração efetiva por frame em ms (média/fixo; 0 → 500 padrão).
+    pub anim_dur_ms: u32,
+    /// Item async → seed por tile dessincroniza a animação (estilo RME);
+    /// sincronizado usa fase global de todos os exemplares.
+    pub anim_async: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -61,6 +74,23 @@ struct CachedSprite {
     base_layer: u32,
     width: u8,
     height: u8,
+}
+
+/// Bloco contíguo de um tipo animado no atlas (todas as fases, em ordem de
+/// `sprite_index`: frame é a dimensão mais externa).
+#[derive(Copy, Clone)]
+struct AnimBlockInfo {
+    /// 0 = falhou (sprite ausente/atlas cheio) → renderiza frame 0 estático.
+    frames: u32,
+    /// Célula do sprite de `sprite_index == 0`.
+    strip_base: u32,
+    /// Sprites por frame = pattern_stride (fz*fy*fx*layers).
+    sprites_per_frame: u32,
+    /// Blocos 32×32 que cada sprite ocupa (width*height).
+    cells_per_sprite: u32,
+    width: u8,
+    height: u8,
+    dur_ms: u32,
 }
 
 impl SpriteResolver {
@@ -87,6 +117,7 @@ impl SpriteResolver {
             assets_dir,
             sheet_cache: AHashMap::new(),
             sprite_layer: AHashMap::new(),
+            anim_block: AHashMap::new(),
             resolved: 0,
             cache_hits: 0,
             decode_failures: 0,
@@ -117,13 +148,12 @@ impl SpriteResolver {
             return ItemVisual::default();
         };
 
-        // Copia os dados da luz para locais (enum) antes de qualquer borrow
-        // mutável de `self` abaixo; `item_type` vive só até aqui.
+        // Copia os dados para locais (enum) antes de qualquer borrow mutável
+        // de `self` abaixo; `item_type` vive só até aqui.
         let has_light = item_type.has_light();
         let light_color = item_type.sprite.light_color;
         let light_intensity = item_type.sprite.light_intensity;
         let is_animated = item_type.is_animated();
-
         let (offset_x, offset_y) = item_type.draw_offset();
         let visual = ItemVisual {
             layer_index: 0,
@@ -135,6 +165,10 @@ impl SpriteResolver {
             light_color,
             light_intensity,
             is_animated,
+            anim_frames: 0,
+            anim_step: 0,
+            anim_dur_ms: 0,
+            anim_async: item_type.async_animation,
         };
 
         // Em itens com padrões (paredes, portas, bordas etc.), o RME escolhe
@@ -165,27 +199,64 @@ impl SpriteResolver {
             return visual;
         }
 
-        // Cache hit?
-        if let Some(&sprite) = self.sprite_layer.get(&sprite_id) {
-            self.cache_hits += 1;
-            return ItemVisual {
-                layer_index: sprite.base_layer,
-                width: sprite.width,
-                height: sprite.height,
-                has_light,
-                light_color,
-                light_intensity,
-                ..visual
-            };
+        // Itens animados: pré-decodifica o bloco contíguo de TODAS as fases em
+        // ordem de `sprite_index` (frame é a dimensão mais externa), garantindo
+        // no atlas a contiguidade que o shader usa com `frame * step_cells`.
+        if is_animated {
+            if self.anim_block.get(&type_id).is_none() {
+                let ids = item_type.sprite_ids.clone();
+                let phases = item_type.animation_phases.clone();
+                let stride = pattern_stride(item_type);
+                let info = self.build_anim_block(device, queue, atlas, ids, phases, stride);
+                self.anim_block.insert(type_id, info);
+            }
+            if let Some(block) = self.anim_block.get(&type_id) && block.frames > 0 {
+                let step = block.sprites_per_frame * block.cells_per_sprite;
+                if step <= 0xffff {
+                    return ItemVisual {
+                        layer_index: block.strip_base + (sprite_index as u32) * block.cells_per_sprite,
+                        width: block.width,
+                        height: block.height,
+                        anim_frames: block.frames,
+                        anim_step: step,
+                        anim_dur_ms: block.dur_ms,
+                        ..visual
+                    };
+                }
+                if self.diagnosed_missing_types.insert(type_id) {
+                    eprintln!("sprite resolver: animação de type_id={type_id} fora do step_cells 16 bits ({step}) — estático");
+                }
+            }
         }
 
-        // Decodificar sheet → célula RGBA 32×32
+        // Caminho estático (também usado como fallback de bloco falho):
+        // resolveso sprite do frame 0.
+        let Some(sprite) = self.resolve_sprite_layer(device, queue, atlas, sprite_id) else {
+            return visual;
+        };
+        ItemVisual { layer_index: sprite.base_layer, width: sprite.width, height: sprite.height, has_light, light_color, light_intensity, ..visual }
+    }
+
+    /// Resolve um sprite único: cache hit, decode da sheet e upload contíguo
+    /// dos blocos 32×32 (ordem de linha) para o atlas.
+    fn resolve_sprite_layer(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &mut SpriteAtlas,
+        sprite_id: u32,
+    ) -> Option<CachedSprite> {
+        if let Some(&sprite) = self.sprite_layer.get(&sprite_id) {
+            self.cache_hits += 1;
+            return Some(sprite);
+        }
+
         let Some(cell) = self.decode_sprite_cell(sprite_id) else {
             self.decode_failures += 1;
             if self.diagnosed_missing_sprites.insert(sprite_id) {
-                eprintln!("sprite resolver: falha ao decodificar sprite_id={sprite_id} para type_id={type_id}");
+                eprintln!("sprite resolver: falha ao decodificar sprite_id={sprite_id}");
             }
-            return visual;
+            return None;
         };
 
         // Os blocos 32×32 são adicionados em ordem de linha para que o shader
@@ -196,7 +267,7 @@ impl SpriteResolver {
             if layer == 0 {
                 self.atlas_full += 1;
                 eprintln!("sprite resolver: atlas cheio (max_slots={}) sprite_id={sprite_id}", atlas.max_layers());
-                return visual;
+                return None;
             }
             if index == 0 { base_layer = layer; }
         }
@@ -209,10 +280,61 @@ impl SpriteResolver {
         self.sprite_layer.insert(sprite_id, cached);
         self.resolved += 1;
         eprintln!(
-            "sprite resolver: type_id={type_id} sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) size={}x{} base_layer={base_layer}",
+            "sprite resolver: sprite_id={sprite_id} sheet={} layout={:?} cell=({},{}) size={}x{} base_layer={base_layer}",
             cell.sheet_file, cell.layout, cell.cell_x, cell.cell_y, cell.width, cell.height,
         );
-        ItemVisual { layer_index: base_layer, width: cell.width, height: cell.height, has_light, light_color, light_intensity, ..visual }
+        Some(cached)
+    }
+
+    /// Pré-decodifica o bloco completo de `sprite_ids` de um tipo animado em
+    /// ordem, um sprite após o outro (as fases ficam contíguas no atlas).
+    fn build_anim_block(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &mut SpriteAtlas,
+        sprite_ids: Vec<u32>,
+        phases: Vec<(u32, u32)>,
+        pattern_stride: u32,
+    ) -> AnimBlockInfo {
+        if sprite_ids.is_empty() {
+            return AnimBlockInfo { frames: 0, strip_base: 0, sprites_per_frame: 0, cells_per_sprite: 0, width: 0, height: 0, dur_ms: 0 };
+        }
+        let mut base = 0u32;
+        let mut cells_per_sprite = 0u32;
+        let mut sprite_width = 0u8;
+        let mut sprite_height = 0u8;
+        // Contiguidade: cada sprite deve cair exatamente na célula seguinte à
+        // do anterior. Se algum sprite já foi resolvido num bloco de outro tipo
+        // (sprites compartilhados entre tipos), a tira quebra e a animação vira
+        // estática em vez de exibir células erradas.
+        let mut expected = 0u32;
+        for (idx, &sid) in sprite_ids.iter().enumerate() {
+            let Some(cached) = self.resolve_sprite_layer(device, queue, atlas, sid) else {
+                return AnimBlockInfo { frames: 0, strip_base: 0, sprites_per_frame: 0, cells_per_sprite: 0, width: 0, height: 0, dur_ms: 0 };
+            };
+            if idx == 0 {
+                base = cached.base_layer;
+                cells_per_sprite = cached.width as u32 * cached.height as u32;
+                expected = base + cells_per_sprite;
+                sprite_width = cached.width;
+                sprite_height = cached.height;
+            } else {
+                if cached.base_layer != expected {
+                    return AnimBlockInfo { frames: 0, strip_base: 0, sprites_per_frame: 0, cells_per_sprite: 0, width: 0, height: 0, dur_ms: 0 };
+                }
+                expected += cached.width as u32 * cached.height as u32;
+            }
+        }
+        AnimBlockInfo {
+            frames: phases.len() as u32,
+            strip_base: base,
+            sprites_per_frame: pattern_stride.max(1),
+            cells_per_sprite,
+            width: sprite_width,
+            height: sprite_height,
+            dur_ms: resolve_dur_ms(&phases),
+        }
     }
 
     fn decode_sprite_cell(&mut self, sprite_id: u32) -> Option<DecodedSpriteCell> {
@@ -292,3 +414,39 @@ impl SpriteResolver {
 
 // Re-export para conveniência no tabs.rs
 pub use editor_formats::catalog::SpriteLayout;
+
+/// Sprites por frame = strides de padrões × layers (`fz*fy*fx*layers`), a
+/// distância entre fases consecutivas de um mesmo padrão no `sprite_index`.
+fn pattern_stride(item_type: &editor_formats::appearances::ItemType) -> u32 {
+    let fx = item_type.pattern_width.max(1);
+    let fy = item_type.pattern_height.max(1);
+    let fz = item_type.pattern_depth.max(1);
+    let layers = item_type.layers.max(1);
+    fz * fy * fx * layers
+}
+
+/// Duração efetiva por frame (ms) das fases de um tipo animado. Fiel ao
+/// OTClient/RME quando as fases têm a mesma duração (caso comum): devolve o
+/// valor delas. Fases (0,0) caem para a primeira duração não-zero (fix do
+/// OTClient`Animator::unserializeAppearance`). Com durações variadas, a média
+/// aproxima deterministicamente a caminhada ponderada por duração do RME.
+fn resolve_dur_ms(phases: &[(u32, u32)]) -> u32 {
+    if phases.is_empty() {
+        return 0;
+    }
+    let fallback = phases
+        .iter()
+        .find(|(mn, mx)| *mn > 0 || *mx > 0)
+        .map(|(mn, mx)| (((*mn as u64 + *mx as u64) / 2).max(1)) as u32)
+        .unwrap_or(1);
+    let mut sum = 0u64;
+    for (mn, mx) in phases {
+        let dur = if *mn == 0 && *mx == 0 {
+            fallback
+        } else {
+            (((*mn as u64 + *mx as u64) / 2).max(1)) as u32
+        };
+        sum += dur as u64;
+    }
+    ((sum / phases.len() as u64).max(1)) as u32
+}
