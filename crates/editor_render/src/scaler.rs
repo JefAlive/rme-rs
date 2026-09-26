@@ -185,7 +185,7 @@ impl ScaleResources {
         let layout_mdapt_dual = Self::glsl_layout_dual(device, "scene_scaler_mdapt_dual_bgl", std::mem::size_of::<TexSizeUniform>() as u64);
         // Pós na imagem final: amostragem linear (window do libretro usa GL
         // linear no bloom; o CRT colour é um shift por texel, tanto faz).
-        let layout_crt_color = Self::glsl_layout_filter(device, "scene_scaler_crt_color_bgl", None);
+        let layout_crt_color = Self::glsl_layout_filter(device, "scene_scaler_crt_color_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
         let layout_crt_bloom = Self::glsl_layout_filter(device, "scene_scaler_crt_bloom_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
         let layout_lens_mist = Self::glsl_layout_filter(device, "scene_scaler_lens_mist_bgl", Some(std::mem::size_of::<TexSizeUniform>() as u64));
         // Layout para conversão final linear→sRGB: textura + sampler linear, sem uniforms.
@@ -758,13 +758,22 @@ impl ScaleResources {
         self.encode_draw(device, queue, &self.pipeline_lens_mist, &bind_group, target, "scene_scaler_lens_mist_pass");
     }
 
-    /// CRT colour: fosforo P22 (NTSC D65) aplicado fielmente à imagem final.
-    pub fn post_color(&self, device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::TextureView, target: &wgpu::TextureView) {
+    /// CRT colour (CRT comum / fosforo de tubo barato): matriz de impureza
+    /// com bleed entre canais + black lift mínimo. `params` é a força (0 =
+    /// identidade); aplicado na imagem final, em linear.
+    pub fn post_color(&self, device: &wgpu::Device, queue: &wgpu::Queue,
+                      source_size: (u32, u32), source: &wgpu::TextureView,
+                      target: &wgpu::TextureView, params: f32) {
+        queue.write_buffer(&self.uniform_tex_size, 0, bytemuck::bytes_of(&TexSizeUniform {
+            texture_size: [source_size.0 as f32, source_size.1 as f32],
+            params: [params, 0.0],
+        }));
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene_scaler_crt_color_bg"), layout: &self.layout_crt_color,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(source) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler_linear) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.uniform_tex_size.as_entire_binding() },
             ],
         });
         self.encode_draw(device, queue, &self.pipeline_crt_color, &bind_group, target, "scene_scaler_crt_color_pass");

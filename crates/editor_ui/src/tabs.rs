@@ -16,6 +16,10 @@ const LENS_MIST_STRENGTH: f32 = 0.250;
 /// Força fixa do halation de fósforo do CRT Bloom (sem slider), de dia.
 const CRT_BLOOM_STRENGTH: f32 = 0.200;
 
+/// Força do CRT Colors (CRT comum, sem slider): 1.0 = matriz de impureza
+/// completa; 0 = identidade.
+const CRT_COLOR_STRENGTH: f32 = 1.0;
+
 /// Flicker de luzes de itens ANIMADOS, contínuo por cor/tamanho:
 /// - SEM animação → luz estática (o `is_animated` vem no TileLight).
 /// - MENOR → caos moderado, rápido, raio sutil; MAIOR → ainda mais sutil e
@@ -893,11 +897,11 @@ impl<'a> EditorTabViewer<'a> {
                             scaler.post_mist(device, queue, post_size, &output.view, &post.view, LENS_MIST_STRENGTH, self.state.world_light);
                             scaler.post_bloom(device, queue, post_size, &post.view, &output.view, CRT_BLOOM_STRENGTH, self.state.world_light);
                             if self.state.shaders.crt_color {
-                                scaler.post_color(device, queue, &output.view, &post.view);
+                                scaler.post_color(device, queue, post_size, &output.view, &post.view, CRT_COLOR_STRENGTH);
                                 scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
                             }
                         } else if self.state.shaders.crt_color {
-                            scaler.post_color(device, queue, &output.view, &post.view);
+                            scaler.post_color(device, queue, post_size, &output.view, &post.view, CRT_COLOR_STRENGTH);
                             scaler.copy_scene(device, queue, post_size, &post.view, &output.view);
                         }
                     }
