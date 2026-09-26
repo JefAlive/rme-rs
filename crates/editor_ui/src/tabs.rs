@@ -41,11 +41,12 @@ fn smoothstep01(e0: f32, e1: f32, x: f32) -> f32 {
 }
 
 /// Aplica o flicker contínuo a emissoras de item ANIMADO (luz estática não
-/// mexe). Tamanho é uma régua: pequena = caótica/rápida/raio vivo, grande =
-/// sutil/lenta/raio quase parado. Cor define o caráter: quente caótica e fria
-/// calma. Ajusta color (brilho) e intensity (raio) por frame, determinístico
-/// por posição; nunca apaga a luz.
-fn flicker_light(mut light: editor_render::scene::TileLight, t: f32) -> editor_render::scene::TileLight {
+/// mexe; chão nunca flickera — gate fora daqui). `seed` (0..1) é a fase do
+/// COMPONENTE: luzes adjacentes do mesmo tipo compartilham seed → movem juntas
+/// (coesas); `damp` (0..1) amortece por tamanho do componente (isolada = 1).
+/// Tamanho é uma régua: pequena = caótica/rápida, grande = sutil/lenta. Cor
+/// define o caráter: quente caótica e fria calma. Nunca apaga a luz.
+fn flicker_light(mut light: editor_render::scene::TileLight, t: f32, seed: f32, damp: f32) -> editor_render::scene::TileLight {
     // Item emissor não-animado → luz estática (sem flicker).
     if light.is_animated == 0 {
         return light;
@@ -56,25 +57,25 @@ fn flicker_light(mut light: editor_render::scene::TileLight, t: f32) -> editor_r
     let warm = r > g && r >= b;
     let size = light.intensity;
 
-    // "Domesticação" contínua pelo tamanho: pequena (≤2.5) → vivid 1 (caos
-    // total); grande (≥8) → vivid 0 (sutil, lento). Nunca desliga.
-    let tame = smoothstep01(2.5, 8.0, size);
+    // "Domesticação" contínua pelo tamanho: pequena/média (≤5) → vivid 1 (caos
+    // cheio); grande (≥10) → vivid 0 (sutil, lento). Nunca desliga.
+    let tame = smoothstep01(5.0, 10.0, size);
     let vivid = 1.0 - tame;
 
     // Cor: frias metade do caos e metade do raio.
     let chaos = if warm { 1.0 } else { FIRE_COLD_FADE };
     let rad_f = if warm { 1.0 } else { FIRE_COLD_RADIUS };
 
-    // Amplitudes: escala com vivid, com piso para grandes.
-    let amp = (FIRE_LARGE_MIN + (1.0 - FIRE_LARGE_MIN) * vivid) * chaos;
-    let rad_amp = FIRE_RADIUS * (FIRE_LARGE_RADIUS + (1.0 - FIRE_LARGE_RADIUS) * vivid) * rad_f;
-    // Velocidade: pequena rápida (~1.4×), grande lenta (~0.55×).
-    let speed = 1.4 - 0.85 * tame;
+    // Amplitudes (vivid + damp)
+    let amp = (FIRE_LARGE_MIN + (1.0 - FIRE_LARGE_MIN) * vivid) * chaos * damp;
+    let rad_amp = FIRE_RADIUS * (FIRE_LARGE_RADIUS + (1.0 - FIRE_LARGE_RADIUS) * vivid) * rad_f * damp;
 
-    let tx = light.world_pos[0].floor();
-    let ty = light.world_pos[1].floor();
-    // Seed 0..1 derivado da posição (chamas próximas "desencronizam").
-    let h = (f32::sin(tx * 12.9898 + ty * 78.233) * 43758.545).fract();
+    // Componente grande = bem mais suave: `calm` (0 = isolada, →1 = área
+    // cheia) reduz velocidade e, principalmente, as bandas rápidas/pop que
+    // causam o "caos". A área toda respira junto, lenta e tranquila.
+    let calm = 1.0 - damp;
+    let speed = (1.4 - 0.85 * tame) * (1.0 - 0.5 * calm);
+
     let tau = std::f32::consts::TAU;
     let phi = 1.618_034;
     let st = t * speed;
@@ -82,24 +83,26 @@ fn flicker_light(mut light: editor_render::scene::TileLight, t: f32) -> editor_r
     // Frequências base w e potências de φ (razões irracionais → batimentos
     // que nunca repetem; "chocam" em vez de marcar o ritmo).
     let w = 1.9;
-    let s1 = f32::sin(st * w * phi + h * tau);                               // ~0.49 Hz × speed
-    let s2 = f32::sin(st * w + h * tau * 1.43);                              // ~0.30 Hz (razão ~φ)
-    let slow = 0.5 * s1 + 0.5 * s2;                                          // batimento irregular
-    let s3 = f32::sin(st * w * phi * phi + h * tau * 2.37 + 1.4 * s1);       // ~1.28 Hz × speed
-    let s4 = f32::sin(st * w * phi * phi * phi + h * tau * 3.13 + 2.1 * s3); // ~3.28 Hz × speed
+    let s1 = f32::sin(st * w * phi + seed * tau);                           // ~0.49 Hz × speed
+    let s2 = f32::sin(st * w + seed * tau * 1.43);                          // ~0.30 Hz (razão ~φ)
+    let slow = 0.5 * s1 + 0.5 * s2;                                         // batimento irregular
+    let s3 = f32::sin(st * w * phi * phi + seed * tau * 2.37 + 1.4 * s1);       // ~1.28 Hz × speed
+    let s4 = f32::sin(st * w * phi * phi * phi + seed * tau * 3.13 + 2.1 * s3); // ~3.28 Hz × speed
 
     // Hard edges ocasionais (só quentes): valor quantizado por célula, muda de
-    // salto e é diferente em cada chama.
+    // salto e é diferente em cada chama/componente.
     let cell = (st * 4.5).floor();
-    let r0 = (f32::sin(cell * 1.7 + h * 91.7) * 43758.545).fract();
+    let r0 = (f32::sin(cell * 1.7 + seed * 91.7) * 43758.545).fract();
     let pop = r0 - 0.5;
 
     let d = if warm {
-        amp * (FIRE_SLOW_AMP * slow + FIRE_MID_AMP * s3 + FIRE_FAST_AMP * s4)
-            + FIRE_POP_AMP * amp * pop
+        amp * (FIRE_SLOW_AMP * slow
+            + FIRE_MID_AMP * (1.0 - 0.25 * calm) * s3
+            + FIRE_FAST_AMP * (1.0 - 0.8 * calm) * s4)
+            + FIRE_POP_AMP * amp * (1.0 - 0.7 * calm) * pop
     } else {
         // Frio: só bandas lenta/média (sem fast, sem pop) → menos caótico.
-        amp * (FIRE_SLOW_AMP * slow + FIRE_MID_AMP * 0.8 * s3)
+        amp * (FIRE_SLOW_AMP * slow + FIRE_MID_AMP * 0.8 * (1.0 - 0.25 * calm) * s3)
     };
     let rf = 1.0 + rad_amp * (0.6 * s3 + 0.4 * s4);
 
@@ -109,6 +112,124 @@ fn flicker_light(mut light: editor_render::scene::TileLight, t: f32) -> editor_r
     }
     light.intensity = (light.intensity * rf.max(0.5)).max(0.5);
     light
+}
+
+/// Hash determinístico 0..1 a partir de duas coordenadas (tiles fracionários)
+/// e um eixo — fase comum de um componente de luzes.
+fn hash_unit(x: f32, y: f32, z: f32) -> f32 {
+    (f32::sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.545).fract()
+}
+
+/// Union-find de componentes de luz (feito por frame; n = nº de luzes
+/// visíveis, ordem de grandeza irrelevante num editor).
+struct ComponentUnion {
+    parent: Vec<usize>,
+    size: Vec<usize>,
+}
+impl ComponentUnion {
+    fn new(n: usize) -> Self {
+        Self { parent: (0..n).collect(), size: vec![1; n] }
+    }
+    fn find(&mut self, mut i: usize) -> usize {
+        while self.parent[i] != i {
+            self.parent[i] = self.parent[self.parent[i]];
+            i = self.parent[i];
+        }
+        i
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let mut ra = self.find(a);
+        let mut rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        if self.size[ra] < self.size[rb] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        self.parent[rb] = ra;
+        self.size[ra] += self.size[rb];
+    }
+}
+
+/// Fator de extensão do raio da luz — precisa bater com o `RADIUS_EXT` dos
+/// shaders (`light_vertex.wgsl` / `light_fragment.wgsl`), onde o falloff zera
+/// em `dist = intensity * RADIUS_EXT`.
+const LIGHT_RADIUS_EXT: f32 = 1.75;
+
+/// Para cada luz, `Some(seed, damp)` se ela é participante de flicker (item
+/// animado); `None` (estática) para chão e inanimadas.
+/// Participantes do MESMO andar com círculos de luz SOBREPOSTOS (distância
+/// entre centros ≤ (r1+r2)×1.05) — de qualquer cor — são unidos num
+/// componente que compartilha UM seed (movem juntos = coesos) e `damp` cai
+/// com o tamanho do componente (área grande → calma; isolada → viva).
+fn flicker_component_seed_damp(lights: &[(u8, editor_render::scene::TileLight)]) -> Vec<Option<(f32, f32)>> {
+    struct Part { z: u8, x: f32, y: f32, r: f32 }
+    let mut parts: Vec<Option<Part>> = Vec::with_capacity(lights.len());
+    for (z, l) in lights {
+        if l.is_ground != 0 || l.is_animated == 0 {
+            parts.push(None);
+            continue;
+        }
+        parts.push(Some(Part {
+            z: *z,
+            x: l.world_pos[0],
+            y: l.world_pos[1],
+            r: l.intensity * LIGHT_RADIUS_EXT,
+        }));
+    }
+    let particip: Vec<(usize, &Part)> = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.as_ref().map(|p| (i, p)))
+        .collect();
+
+    let mut uf = ComponentUnion::new(parts.len());
+    // Agrupa por andar (luzes de z diferentes nunca se conectam) e checa
+    // sobreposição par a par: círculos se cruzam se a distância entre centros
+    // ≤ (r1 + r2) * 0.9. Abaixo de 1.0 exige sobreposição DE VERDADE (quase-
+    // toque e bordas afastadas ficam de fora) — unir menos evita que áreas
+    // distantes colapsem num componente só.
+    let mut by_z: std::collections::HashMap<u8, Vec<usize>> = std::collections::HashMap::new();
+    for (i, _) in &particip {
+        by_z.entry(parts[*i].as_ref().unwrap().z).or_default().push(*i);
+    }
+    let ov = 0.9_f32;
+    for idxs in by_z.values() {
+        for a in 0..idxs.len() {
+            let p = parts[idxs[a]].as_ref().unwrap();
+            for b in (a + 1)..idxs.len() {
+                let q = parts[idxs[b]].as_ref().unwrap();
+                let d2 = (p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y);
+                let thresh = (p.r + q.r) * ov;
+                if d2 <= thresh * thresh {
+                    uf.union(idxs[a], idxs[b]);
+                }
+            }
+        }
+    }
+
+    // Âncora (menor x, depois y) e tamanho de cada componente.
+    let mut anchors: std::collections::HashMap<usize, (f32, f32, u8)> = std::collections::HashMap::new();
+    let mut sizes: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, p) in &particip {
+        let root = uf.find(*i);
+        let cur = anchors.entry(root).or_insert((p.x, p.y, p.z));
+        if p.x < cur.0 || (p.x == cur.0 && p.y < cur.1) {
+            *cur = (p.x, p.y, p.z);
+        }
+        *sizes.entry(root).or_default() += 1;
+    }
+
+    let mut out: Vec<Option<(f32, f32)>> = vec![None; parts.len()];
+    for (i, p) in &particip {
+        let root = uf.find(*i);
+        let (ax, ay, az) = anchors.get(&root).copied().unwrap_or((p.x, p.y, p.z));
+        let sz = sizes.get(&root).copied().unwrap_or(1).max(1);
+        let seed = hash_unit(ax, ay, az as f32);
+        let damp = (1.0 / (1.0 + 0.12 * (sz - 1) as f32)).max(0.06);
+        out[*i] = Some((seed, damp));
+    }
+    out
 }
 
 /// Bounding box dos tiles com chão no andar informado (para a câmera).
@@ -705,13 +826,24 @@ impl<'a> EditorTabViewer<'a> {
                     let max_ty = (oy + vh / zy) / 32.0 + margin;
                     let mut visible_lights: Vec<editor_render::scene::TileLight> = Vec::new();
                     let flicker_t = ui.input(|i| i.time) as f32;
+                    let mut raw_lights: Vec<(u8, editor_render::scene::TileLight)> = Vec::new();
                     for layer in &layers {
                         for light in self.state.chunk_cache.lights(layer.z) {
                             if light.intensity > 0.0
                                 && light.world_pos[0] >= min_tx && light.world_pos[0] <= max_tx
                                 && light.world_pos[1] >= min_ty && light.world_pos[1] <= max_ty {
-                                visible_lights.push(flicker_light(*light, flicker_t));
+                                raw_lights.push((layer.z, *light));
                             }
+                        }
+                    }
+                    // Componentes conexos: luzes de item adjacentes do mesmo tipo
+                    // compartilham fase (coesas) e amortecem por tamanho; chão e
+                    // inanimadas ficam estáticas (`None`).
+                    let comps = flicker_component_seed_damp(&raw_lights);
+                    for (i, (_z, light)) in raw_lights.iter().enumerate() {
+                        match comps[i] {
+                            Some((seed, damp)) => visible_lights.push(flicker_light(*light, flicker_t, seed, damp)),
+                            None => visible_lights.push(*light),
                         }
                     }
                     scaler.render_lights(device, queue, &camera, &visible_lights, (scene_width, scene_height), [ambient; 3]);

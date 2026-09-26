@@ -22,7 +22,9 @@ pub struct TileLight {
     pub is_animated: u32,
     /// Cor linear RGB 0..1 (convertida da paleta 6×6×6 do Tibia)
     pub color: [f32; 3],
-    _pad1: f32,
+    /// 1 se a luz vem do GROUND (chão). Chão nunca flickera (luz de material,
+    /// não de fonte viva) — só itens animados flickeram. A GPU não lê (pad).
+    pub is_ground: u32,
 }
 
 #[derive(Default)]
@@ -75,7 +77,7 @@ impl ChunkGpuCache {
             if let Some(ground) = &tile.ground {
                 let visual = resolve_visual(ground.type_id, pos);
                 if visual.has_light {
-                    floor_lights.push(tilelight_from_visual(&visual, pos));
+                    floor_lights.push(tilelight_from_visual(&visual, pos, 1));
                 }
                 append_visual_instances(&mut instances, pos, visual, elevation);
                 elevation += visual.elevation;
@@ -83,7 +85,7 @@ impl ChunkGpuCache {
             for item in &tile.items {
                 let visual = resolve_visual(item.type_id, pos);
                 if visual.has_light {
-                    floor_lights.push(tilelight_from_visual(&visual, pos));
+                    floor_lights.push(tilelight_from_visual(&visual, pos, 0));
                 }
                 append_visual_instances(&mut instances, pos, visual, elevation);
                 elevation += visual.elevation;
@@ -111,7 +113,7 @@ impl ChunkGpuCache {
     }
 }
 
-fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position) -> TileLight {
+fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position, is_ground: u32) -> TileLight {
     // Converte cor 8-bit Tibia (6×6×6) para RGB linear 0..1
     let color8 = visual.light_color;
     let (r, g, b) = if color8 == 0 || color8 >= 216 {
@@ -135,7 +137,7 @@ fn tilelight_from_visual(visual: &crate::assets::ItemVisual, pos: Position) -> T
         intensity: visual.light_intensity as f32,
         is_animated: u32::from(visual.is_animated),
         color: [r, g, b],
-        _pad1: 0.0,
+        is_ground,
     }
 }
 

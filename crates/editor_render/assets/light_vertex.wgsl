@@ -1,6 +1,9 @@
 // Light vertex shader (WGSL) — gera um quad por fonte de luz com raio =
-// intensity tiles (TriangleStrip, 4 vértices por instância). O fragment
-// calcula o falloff OTClient; aqui só posiciona o quad.
+// intensity * RADIUS_EXT tiles (TriangleStrip, 4 vértices por instância).
+// O fragment calcula o falloff OTClient; aqui só posiciona o quad.
+// RADIUS_EXT precisa bater com o light_fragment (o corte da cauda acontece
+// em dist = intensity * RADIUS_EXT; quad menor que isso corta a luz).
+const RADIUS_EXT: f32 = 1.75;
 // A instância (TileLight) entra como vertex buffer de instância (padrão do
 // scene; o backend GL aqui tem limite 0 de storage buffers por shader).
 // Layout do camera uniform é o CameraUniform (48 bytes), idêntico ao vs_main
@@ -37,7 +40,7 @@ const TILE_SIZE: f32 = 32.0;
 
 @vertex
 fn vs_main(in: VsIn, @builtin(vertex_index) vertex_index: u32) -> VsOut {
-    let light_radius = max(in.intensity, 0.0);
+    let light_radius = max(in.intensity * RADIUS_EXT, 0.0);
 
     // Cantos do quad em tiles relativos ao centro (TriangleStrip 0..4).
     // x: índice par → -1, ímpar → +1; y: 0..1 → -1, 2..3 → +1.
